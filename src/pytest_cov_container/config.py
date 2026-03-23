@@ -1,6 +1,5 @@
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 try:
     import tomllib
@@ -12,15 +11,15 @@ from pytest_cov_container.models import DriverConfig
 
 @dataclass
 class PluginConfig:
-    image_pattern: Optional[str] = None
-    label: Optional[str] = None
+    image_pattern: str | None = None
+    label: str | None = None
     language: str = "python"
     enabled: bool = True
     path_mapping: dict[str, str] = field(default_factory=dict)
-    driver_config: Optional[DriverConfig] = None
+    driver_config: DriverConfig | None = None
 
 
-def load_config(pyproject_path: Path) -> Optional[PluginConfig]:
+def load_config(pyproject_path: Path) -> PluginConfig | None:
     if not pyproject_path.exists():
         return None
 
@@ -31,9 +30,7 @@ def load_config(pyproject_path: Path) -> Optional[PluginConfig]:
     if tool_config is None:
         return None
 
-    path_mapping = {
-        str(k): str(v) for k, v in tool_config.get("path_mapping", {}).items()
-    }
+    path_mapping = {str(k): str(v) for k, v in tool_config.get("path_mapping", {}).items()}
 
     plugin_config = PluginConfig(
         image_pattern=tool_config.get("image_pattern"),
@@ -46,9 +43,7 @@ def load_config(pyproject_path: Path) -> Optional[PluginConfig]:
     driver_section = tool_config.get(plugin_config.language, {})
     plugin_config.driver_config = DriverConfig(
         build_dir=driver_section.get("build_dir", ".aws-sam/build/ApiFunction"),
-        entrypoint=driver_section.get(
-            "entrypoint", "uvicorn app:app --host 0.0.0.0 --port 8080"
-        ),
+        entrypoint=driver_section.get("entrypoint", "uvicorn app:app --host 0.0.0.0 --port 8080"),
         path_mapping=path_mapping,
     )
 

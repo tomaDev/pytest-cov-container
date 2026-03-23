@@ -25,10 +25,7 @@ class TestLoadConfig:
         result = config.load_config(sample_pyproject)
         assert result.driver_config is not None
         assert result.driver_config.build_dir == ".aws-sam/build/ApiFunction"
-        assert (
-            result.driver_config.entrypoint
-            == "uvicorn app:app --host 0.0.0.0 --port 8080"
-        )
+        assert result.driver_config.entrypoint == "uvicorn app:app --host 0.0.0.0 --port 8080"
         assert result.driver_config.path_mapping == {"src/api": "/var/task"}
 
     def test_defaults_when_minimal_config(self, tmp_path):

@@ -1,7 +1,3 @@
-from pathlib import Path
-
-import pytest
-
 from pytest_cov_container.resolver import SamBuildResolver
 
 

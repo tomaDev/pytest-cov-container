@@ -8,9 +8,7 @@ class TestFindContainers:
     def test_finds_by_label(self, mock_docker_client, mock_docker_container):
         backend = DockerBackend(client=mock_docker_client)
         containers = backend.find_containers(label="pytest-cov-container")
-        mock_docker_client.containers.list.assert_called_once_with(
-            all=True, filters={"label": "pytest-cov-container"}
-        )
+        mock_docker_client.containers.list.assert_called_once_with(all=True, filters={"label": "pytest-cov-container"})
         assert len(containers) == 1
         assert containers[0].id == mock_docker_container.id
 
@@ -69,9 +67,7 @@ class TestExtractMatchingFiles:
         mock_docker_container.get_archive.return_value = (iter([tar_data]), {})
         backend = DockerBackend(client=mock_docker_client)
 
-        extracted = backend.extract_matching_files(
-            mock_docker_container.id, "/tmp", ".coverage.container", tmp_path
-        )
+        extracted = backend.extract_matching_files(mock_docker_container.id, "/tmp", ".coverage.container", tmp_path)
 
         assert len(extracted) == 2
         assert all(p.exists() for p in extracted)
@@ -82,7 +78,5 @@ class TestExtractMatchingFiles:
         mock_docker_container.get_archive.return_value = (iter([tar_data]), {})
         backend = DockerBackend(client=mock_docker_client)
 
-        extracted = backend.extract_matching_files(
-            mock_docker_container.id, "/tmp", ".coverage.container", tmp_path
-        )
+        extracted = backend.extract_matching_files(mock_docker_container.id, "/tmp", ".coverage.container", tmp_path)
         assert extracted == []
