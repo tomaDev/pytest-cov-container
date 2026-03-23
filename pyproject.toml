@@ -5,26 +5,37 @@ build-backend = "hatchling.build"
 [project]
 name = "pytest-cov-container"
 dynamic = ["version"]
-description = 'pytest plugin to add coverage to code running in a container accessed via IO'
+description = "Pytest plugin to collect code coverage from applications running inside Docker containers"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 license = "MIT"
-keywords = []
+keywords = ["pytest", "coverage", "docker", "containers", "testing"]
 authors = [
   { name = "tomaDev", email = "genins21@gmail.com" },
 ]
 classifiers = [
-  "Development Status :: 4 - Beta",
+  "Development Status :: 3 - Alpha",
+  "Framework :: Pytest",
   "Programming Language :: Python",
-  "Programming Language :: Python :: 3.8",
-  "Programming Language :: Python :: 3.9",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
   "Programming Language :: Python :: Implementation :: CPython",
-  "Programming Language :: Python :: Implementation :: PyPy",
 ]
-dependencies = []
+dependencies = [
+  "pytest>=7.0",
+  "pytest-cov>=4.0",
+  "docker>=6.0",
+  "coverage>=7.2",
+  "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.entry-points.pytest11]
+cov_container = "pytest_cov_container.plugin"
+
+[project.entry-points."pytest_cov_container.drivers"]
+python = "pytest_cov_container.drivers.python:PythonDriver"
 
 [project.urls]
 Documentation = "https://github.com/tomaDev/pytest-cov-container#readme"
@@ -34,12 +45,10 @@ Source = "https://github.com/tomaDev/pytest-cov-container"
 [tool.hatch.version]
 path = "src/pytest_cov_container/__about__.py"
 
-[tool.hatch.envs.types]
+[tool.hatch.envs.hatch-test]
 extra-dependencies = [
-  "mypy>=1.0.0",
+  "pytest-mock",
 ]
-[tool.hatch.envs.types.scripts]
-check = "mypy --install-types --non-interactive {args:src/pytest_cov_container tests}"
 
 [tool.coverage.run]
 source_pkgs = ["pytest_cov_container", "tests"]
