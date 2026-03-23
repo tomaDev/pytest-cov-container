@@ -7,7 +7,7 @@ name = "pytest-cov-container"
 dynamic = ["version"]
 description = "Pytest plugin to collect code coverage from applications running inside Docker containers"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = "MIT"
 keywords = ["pytest", "coverage", "docker", "containers", "testing"]
 authors = [
@@ -17,10 +17,11 @@ classifiers = [
   "Development Status :: 3 - Alpha",
   "Framework :: Pytest",
   "Programming Language :: Python",
-  "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: 3.15",
   "Programming Language :: Python :: Implementation :: CPython",
 ]
 dependencies = [
@@ -28,7 +29,6 @@ dependencies = [
   "pytest-cov>=4.0",
   "docker>=6.0",
   "coverage>=7.2",
-  "tomli>=2.0; python_version < '3.11'",
 ]
 
 [project.entry-points.pytest11]
@@ -49,6 +49,9 @@ path = "src/pytest_cov_container/__about__.py"
 extra-dependencies = [
   "pytest-mock",
 ]
+
+[[tool.hatch.envs.hatch-test.matrix]]
+python = ["3.11", "3.12", "3.13", "3.14", "3.15"]
 
 [tool.coverage.run]
 source_pkgs = ["pytest_cov_container", "tests"]

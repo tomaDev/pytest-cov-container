@@ -1,10 +1,7 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 
-try:
-    import tomllib
-except ModuleNotFoundError:
-    import tomli as tomllib
+import tomllib
 
 from pytest_cov_container.models import DriverConfig
 
