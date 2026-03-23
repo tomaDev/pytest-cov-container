@@ -1,4 +1,5 @@
 import subprocess
+import sys
 import tempfile
 import warnings
 from pathlib import Path
@@ -62,14 +63,16 @@ class ContainerCovPlugin:
 
     def _combine_coverage(self, root: Path):
         rc_path = self.coverage_dir / ".coveragerc"
-        lines = ["[paths]", "source ="]
-        for host_path, container_path in self.config.path_mapping.items():
+        lines = ["[paths]"]
+        for i, (host_path, container_path) in enumerate(self.config.path_mapping.items()):
+            label = "source" if i == 0 else f"source{i}"
+            lines.append(f"{label} =")
             lines.append(f"    {host_path}")
             lines.append(f"    {container_path}")
         rc_path.write_text("\n".join(lines) + "\n")
 
         result = subprocess.run(
-            ["coverage", "combine", f"--rcfile={rc_path}", str(self.coverage_dir)],  # noqa: S607
+            [sys.executable, "-m", "coverage", "combine", f"--rcfile={rc_path}", str(self.coverage_dir)],
             check=False,
             cwd=root,
             capture_output=True,

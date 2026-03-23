@@ -87,8 +87,7 @@ class TestContainerCovPluginSessionFinish:
         mock_subprocess.assert_called_once()
         call_args = mock_subprocess.call_args
         cmd = call_args[0][0]
-        assert cmd[0] == "coverage"
-        assert cmd[1] == "combine"
+        assert cmd[1:4] == ["-m", "coverage", "combine"]
 
     @patch("pytest_cov_container.plugin.DockerBackend")
     @patch("subprocess.run")

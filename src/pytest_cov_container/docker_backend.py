@@ -1,6 +1,7 @@
 import fnmatch
 import io
 import tarfile
+import warnings
 from pathlib import Path
 
 import docker
@@ -40,8 +41,15 @@ class DockerBackend:
         return [self._to_info(c) for c in containers]
 
     def send_signal(self, container_id: str) -> None:
-        container = self._client.containers.get(container_id)
-        container.exec_run(_SIGNAL_CMD)
+        try:
+            container = self._client.containers.get(container_id)
+            container.exec_run(_SIGNAL_CMD)
+        except docker.errors.APIError as exc:
+            warnings.warn(
+                f"Failed to send signal to container {container_id[:12]}: {exc}",
+                UserWarning,
+                stacklevel=2,
+            )
 
     def extract_matching_files(
         self,
@@ -50,8 +58,16 @@ class DockerBackend:
         prefix: str,
         dest: Path,
     ) -> list[Path]:
-        container = self._client.containers.get(container_id)
-        stream, _ = container.get_archive(source_dir)
+        try:
+            container = self._client.containers.get(container_id)
+            stream, _ = container.get_archive(source_dir)
+        except docker.errors.APIError as exc:
+            warnings.warn(
+                f"Failed to extract from container {container_id[:12]}: {exc}. Check that the container is accessible.",
+                UserWarning,
+                stacklevel=2,
+            )
+            return []
 
         tar_bytes = b"".join(stream)
         extracted: list[Path] = []
