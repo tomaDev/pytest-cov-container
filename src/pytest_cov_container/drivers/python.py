@@ -3,7 +3,7 @@ import time
 import warnings
 from pathlib import Path
 
-from pytest_cov_container.models import ContainerInfo, DriverConfig, InjectionResult
+from pytest_cov_container.models import ContainerInfo, DockerBackendProtocol, DriverConfig, InjectionResult
 
 _COVERAGERC_TEMPLATE = """\
 [run]
@@ -79,7 +79,7 @@ class PythonDriver:
 
     def collect(
         self,
-        docker_backend: object,
+        docker_backend: DockerBackendProtocol,
         container: ContainerInfo,
         dest: Path,
         config: DriverConfig,  # noqa: ARG002

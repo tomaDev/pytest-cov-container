@@ -46,12 +46,28 @@ Source = "https://github.com/tomaDev/pytest-cov-container"
 path = "src/pytest_cov_container/__about__.py"
 
 [tool.hatch.envs.hatch-test]
-extra-dependencies = [
-  "pytest-mock",
-]
+parallel = true
+randomize = true
+extra-dependencies = []
 
 [[tool.hatch.envs.hatch-test.matrix]]
 python = ["3.11", "3.12", "3.13", "3.14", "3.15"]
+
+[tool.hatch.envs.security]
+dependencies = ["bandit[toml]"]
+
+[tool.hatch.envs.security.scripts]
+scan = "bandit -r src/ -c pyproject.toml"
+
+[tool.hatch.envs.types]
+dependencies = ["ty"]
+
+[tool.hatch.envs.types.scripts]
+check = "ty check src/"
+
+[tool.bandit]
+exclude_dirs = ["tests"]
+skips = ["B108", "B404", "B603"]
 
 [tool.coverage.run]
 source_pkgs = ["pytest_cov_container", "tests"]

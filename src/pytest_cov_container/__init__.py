@@ -2,8 +2,9 @@
 #
 # SPDX-License-Identifier: MIT
 import warnings
+from typing import Any
 
-_active_plugin: object | None = None
+_active_plugin: Any = None
 
 
 def collect_container_coverage():

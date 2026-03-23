@@ -5,6 +5,7 @@ import warnings
 from pathlib import Path
 
 import docker
+import docker.errors
 
 from pytest_cov_container.models import ContainerInfo
 

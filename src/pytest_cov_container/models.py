@@ -25,6 +25,18 @@ class InjectionResult:
     env_vars: dict[str, str] = field(default_factory=dict)
 
 
+class DockerBackendProtocol(Protocol):
+    def send_signal(self, container_id: str) -> None: ...
+
+    def extract_matching_files(
+        self,
+        container_id: str,
+        source_dir: str,
+        prefix: str,
+        dest: Path,
+    ) -> list[Path]: ...
+
+
 @runtime_checkable
 class LanguageDriver(Protocol):
     name: str
@@ -33,7 +45,7 @@ class LanguageDriver(Protocol):
 
     def collect(
         self,
-        docker_backend: object,
+        docker_backend: DockerBackendProtocol,
         container: ContainerInfo,
         dest: Path,
         config: DriverConfig,
