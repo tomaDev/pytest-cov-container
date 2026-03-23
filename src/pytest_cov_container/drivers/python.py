@@ -1,7 +1,9 @@
 import stat
+import time
+import warnings
 from pathlib import Path
 
-from pytest_cov_container.models import DriverConfig, InjectionResult
+from pytest_cov_container.models import ContainerInfo, DriverConfig, InjectionResult
 
 _COVERAGERC_TEMPLATE = """\
 [run]
@@ -74,3 +76,27 @@ class PythonDriver:
             files_written=files_written,
             env_vars={"COVERAGE_PROCESS_START": "/var/task/.coveragerc"},
         )
+
+    def collect(
+        self,
+        docker_backend: object,
+        container: ContainerInfo,
+        dest: Path,
+        config: DriverConfig,
+    ) -> Path:
+        if container.status == "running":
+            docker_backend.send_signal(container.id)
+            time.sleep(1)
+
+        extracted = docker_backend.extract_matching_files(
+            container.id, "/tmp", ".coverage.container", dest
+        )
+
+        if not extracted:
+            warnings.warn(
+                f"No coverage data found in container {container.name} ({container.id[:12]})",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        return dest
