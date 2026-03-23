@@ -82,14 +82,17 @@ class PythonDriver:
         docker_backend: object,
         container: ContainerInfo,
         dest: Path,
-        config: DriverConfig,
+        config: DriverConfig,  # noqa: ARG002
     ) -> Path:
         if container.status == "running":
             docker_backend.send_signal(container.id)
             time.sleep(1)
 
         extracted = docker_backend.extract_matching_files(
-            container.id, "/tmp", ".coverage.container", dest
+            container.id,
+            "/tmp",
+            ".coverage.container",
+            dest,  # noqa: S108
         )
 
         if not extracted:

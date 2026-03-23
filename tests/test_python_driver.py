@@ -1,7 +1,10 @@
 import stat
+from unittest.mock import MagicMock
+
+import pytest
 
 from pytest_cov_container.drivers.python import PythonDriver
-from pytest_cov_container.models import DriverConfig, InjectionResult
+from pytest_cov_container.models import ContainerInfo, DriverConfig, InjectionResult
 
 
 class TestPythonDriverInject:
@@ -58,3 +61,57 @@ class TestPythonDriverInject:
         self.driver.inject(tmp_path, custom_config)
         content = (tmp_path / "_cov_wrapper.py").read_text()
         assert "gunicorn app:app -b 0.0.0.0:9000" in content
+
+
+class TestPythonDriverCollect:
+    def setup_method(self):
+        self.driver = PythonDriver()
+        self.config = DriverConfig(
+            build_dir=".aws-sam/build/ApiFunction",
+            entrypoint="uvicorn app:app --host 0.0.0.0 --port 8080",
+            path_mapping={"src/api": "/var/task"},
+        )
+        self.container_running = ContainerInfo(
+            id="abc123",
+            name="sam-api",
+            image="samcli/lambda:3.12",
+            labels={},
+            status="running",
+        )
+        self.container_stopped = ContainerInfo(
+            id="def456",
+            name="sam-api",
+            image="samcli/lambda:3.12",
+            labels={},
+            status="exited",
+        )
+
+    def test_signals_running_container(self, tmp_path):
+        mock_backend = MagicMock()
+        mock_backend.extract_matching_files.return_value = []
+        self.driver.collect(mock_backend, self.container_running, tmp_path, self.config)
+        mock_backend.send_signal.assert_called_once_with("abc123")
+
+    def test_skips_signal_for_stopped_container(self, tmp_path):
+        mock_backend = MagicMock()
+        mock_backend.extract_matching_files.return_value = []
+        self.driver.collect(mock_backend, self.container_stopped, tmp_path, self.config)
+        mock_backend.send_signal.assert_not_called()
+
+    def test_extracts_coverage_files(self, tmp_path):
+        mock_backend = MagicMock()
+        cov_file = tmp_path / ".coverage.container.host.1.abc"
+        cov_file.write_bytes(b"data")
+        mock_backend.extract_matching_files.return_value = [cov_file]
+
+        result = self.driver.collect(mock_backend, self.container_stopped, tmp_path, self.config)
+
+        mock_backend.extract_matching_files.assert_called_once_with("def456", "/tmp", ".coverage.container", tmp_path)
+        assert result == tmp_path
+
+    def test_warns_when_no_coverage_data(self, tmp_path):
+        mock_backend = MagicMock()
+        mock_backend.extract_matching_files.return_value = []
+
+        with pytest.warns(UserWarning, match="No coverage data found"):
+            self.driver.collect(mock_backend, self.container_stopped, tmp_path, self.config)
