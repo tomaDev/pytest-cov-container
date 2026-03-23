@@ -90,9 +90,9 @@ class PythonDriver:
 
         extracted = docker_backend.extract_matching_files(
             container.id,
-            "/tmp",
+            "/tmp",  # noqa: S108
             ".coverage.container",
-            dest,  # noqa: S108
+            dest,
         )
 
         if not extracted:
