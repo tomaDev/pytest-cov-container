@@ -1,0 +1,61 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pytest-cov-container"
+dynamic = ["version"]
+description = 'pytest plugin to add coverage to code running in a container accessed via IO'
+readme = "README.md"
+requires-python = ">=3.8"
+license = "MIT"
+keywords = []
+authors = [
+  { name = "tomaDev", email = "genins21@gmail.com" },
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Programming Language :: Python :: Implementation :: PyPy",
+]
+dependencies = []
+
+[project.urls]
+Documentation = "https://github.com/tomaDev/pytest-cov-container#readme"
+Issues = "https://github.com/tomaDev/pytest-cov-container/issues"
+Source = "https://github.com/tomaDev/pytest-cov-container"
+
+[tool.hatch.version]
+path = "src/pytest_cov_container/__about__.py"
+
+[tool.hatch.envs.types]
+extra-dependencies = [
+  "mypy>=1.0.0",
+]
+[tool.hatch.envs.types.scripts]
+check = "mypy --install-types --non-interactive {args:src/pytest_cov_container tests}"
+
+[tool.coverage.run]
+source_pkgs = ["pytest_cov_container", "tests"]
+branch = true
+parallel = true
+omit = [
+  "src/pytest_cov_container/__about__.py",
+]
+
+[tool.coverage.paths]
+pytest_cov_container = ["src/pytest_cov_container", "*/pytest-cov-container/src/pytest_cov_container"]
+tests = ["tests", "*/pytest-cov-container/tests"]
+
+[tool.coverage.report]
+exclude_lines = [
+  "no cov",
+  "if __name__ == .__main__.:",
+  "if TYPE_CHECKING:",
+]
