@@ -61,12 +61,12 @@ class TestContainerCovPluginSessionStart:
 
 
 class TestContainerCovPluginSessionFinish:
-    @pytest.mark.filterwarnings("ignore:coverage combine failed")
     @patch("pytest_cov_container.plugin.DockerBackend")
     @patch("subprocess.run")
     def test_warns_when_no_containers_found(
         self, mock_subprocess, mock_backend_cls, plugin_config
     ):  # noqa: ARG002
+        mock_subprocess.return_value = MagicMock(returncode=0, stderr="", stdout="")
         plugin = ContainerCovPlugin(plugin_config)
         plugin.backend.find_containers.return_value = []
 
@@ -81,6 +81,8 @@ class TestContainerCovPluginSessionFinish:
     def test_collects_and_combines(
         self, mock_subprocess, mock_backend_cls, plugin_config
     ):  # noqa: ARG002
+        # subprocess.run returns rc=0 by default for success path.
+        mock_subprocess.return_value = MagicMock(returncode=0, stderr="", stdout="")
         plugin = ContainerCovPlugin(plugin_config)
         container = ContainerInfo(
             id="abc123",
@@ -95,8 +97,7 @@ class TestContainerCovPluginSessionFinish:
         mock_session = MagicMock()
         mock_session.config.rootpath = Path("/project")
 
-        with pytest.warns(UserWarning, match="coverage combine failed"):
-            plugin.pytest_sessionfinish(mock_session, exitstatus=0)
+        plugin.pytest_sessionfinish(mock_session, exitstatus=0)
 
         mock_subprocess.assert_called_once()
         call_args = mock_subprocess.call_args
@@ -106,9 +107,115 @@ class TestContainerCovPluginSessionFinish:
     @pytest.mark.filterwarnings("ignore:No coverage data found")
     @patch("pytest_cov_container.plugin.DockerBackend")
     @patch("subprocess.run")
+    def test_collects_multiple_containers_in_parallel(
+        self, mock_subprocess, mock_backend_cls, plugin_config
+    ):  # noqa: ARG002
+        # Regression: pre-0.3.0 the collect loop was sequential, which on a
+        # remote docker daemon meant 1s+ wall time per container. Now uses
+        # a ThreadPoolExecutor. Assert all containers' driver.collect is
+        # invoked.
+        from unittest.mock import patch as mock_patch
+
+        mock_subprocess.return_value = MagicMock(returncode=0, stderr="", stdout="")
+        plugin = ContainerCovPlugin(plugin_config)
+        containers = [
+            ContainerInfo(
+                id=f"c{i}",
+                name=f"sam-{i}",
+                image="samcli/lambda:3.12",
+                labels={},
+                status="exited",
+            )
+            for i in range(5)
+        ]
+        plugin.backend.find_containers.return_value = containers
+        plugin.backend.extract_matching_files.return_value = []
+
+        mock_session = MagicMock()
+        mock_session.config.rootpath = Path("/project")
+
+        with mock_patch.object(plugin.driver, "collect") as mock_collect:
+            plugin.pytest_sessionfinish(mock_session, exitstatus=0)
+            assert mock_collect.call_count == 5
+            called_ids = {call.args[1].id for call in mock_collect.call_args_list}
+            assert called_ids == {"c0", "c1", "c2", "c3", "c4"}
+
+    @pytest.mark.filterwarnings("ignore:No coverage data found")
+    @patch("pytest_cov_container.plugin.DockerBackend")
+    @patch("subprocess.run")
+    def test_collect_failure_warns_and_continues(
+        self, mock_subprocess, mock_backend_cls, plugin_config
+    ):  # noqa: ARG002
+        # If one container's collect raises, the others must still run.
+        from unittest.mock import patch as mock_patch
+
+        mock_subprocess.return_value = MagicMock(returncode=0, stderr="", stdout="")
+        plugin = ContainerCovPlugin(plugin_config)
+        containers = [
+            ContainerInfo(
+                id=f"c{i}",
+                name=f"sam-{i}",
+                image="samcli/lambda:3.12",
+                labels={},
+                status="exited",
+            )
+            for i in range(3)
+        ]
+        plugin.backend.find_containers.return_value = containers
+        plugin.backend.extract_matching_files.return_value = []
+
+        mock_session = MagicMock()
+        mock_session.config.rootpath = Path("/project")
+
+        def collect_side_effect(backend, container, dest, config):  # noqa: ARG001
+            if container.id == "c1":
+                raise RuntimeError("simulated docker hiccup")
+            return dest
+
+        with (
+            mock_patch.object(
+                plugin.driver, "collect", side_effect=collect_side_effect
+            ),
+            pytest.warns(UserWarning, match="collect failed for container"),
+        ):
+            plugin.pytest_sessionfinish(mock_session, exitstatus=0)
+
+    @pytest.mark.filterwarnings("ignore:No coverage data found")
+    @patch("pytest_cov_container.plugin.DockerBackend")
+    @patch("subprocess.run")
+    def test_combine_failure_raises(
+        self, mock_subprocess, mock_backend_cls, plugin_config
+    ):  # noqa: ARG002
+        # Regression: previously a non-zero combine swallowed the failure
+        # as a UserWarning. Now must raise so CI fails loudly instead of
+        # producing silently-empty coverage reports.
+        mock_subprocess.return_value = MagicMock(
+            returncode=1, stderr="coverage: error happened", stdout=""
+        )
+        plugin = ContainerCovPlugin(plugin_config)
+        container = ContainerInfo(
+            id="abc123",
+            name="t",
+            image="samcli/lambda:3.12",
+            labels={},
+            status="exited",
+        )
+        plugin.backend.find_containers.return_value = [container]
+        plugin.backend.extract_matching_files.return_value = []
+
+        mock_session = MagicMock()
+        mock_session.config.rootpath = Path("/project")
+
+        with pytest.raises(RuntimeError, match="coverage combine failed"):
+            plugin.pytest_sessionfinish(mock_session, exitstatus=0)
+
+    @pytest.mark.filterwarnings("ignore:No coverage data found")
+    @patch("pytest_cov_container.plugin.DockerBackend")
+    @patch("subprocess.run")
     def test_writes_paths_config(
         self, mock_subprocess, mock_backend_cls, plugin_config
     ):  # noqa: ARG002
+        mock_subprocess.return_value = MagicMock(returncode=0, stderr="", stdout="")
         plugin = ContainerCovPlugin(plugin_config)
         container = ContainerInfo(
             id="abc123",
@@ -123,8 +230,7 @@ class TestContainerCovPluginSessionFinish:
         mock_session = MagicMock()
         mock_session.config.rootpath = Path("/project")
 
-        with pytest.warns(UserWarning, match="coverage combine failed"):
-            plugin.pytest_sessionfinish(mock_session, exitstatus=0)
+        plugin.pytest_sessionfinish(mock_session, exitstatus=0)
 
         rc_path = plugin.coverage_dir / ".coveragerc"
         assert rc_path.exists()
@@ -178,13 +284,9 @@ class TestEndToEndDefaultPath:
         )
         assert len(result.files_written) == 4
 
-        # Wrapper artifacts are hardcoded to /var/task; substitute to tmp build_dir.
-        # (Production assumption: Lambda mounts build_dir at /var/task.)
-        for name in (".coveragerc", "_cov_wrapper.py", "run.sh"):
-            p = build / name
-            p.write_text(p.read_text().replace("/var/task", str(build)))
-        # Redirect the hardcoded /tmp data_file path so the test doesn't
-        # pollute /tmp and is independent of parallel test runs.
+        # Wrapper artifacts now self-locate via dirname($0); no /var/task
+        # substitution needed. Just redirect the hardcoded /tmp data_file
+        # so the test doesn't pollute /tmp under xdist.
         rc = build / ".coveragerc"
         rc.write_text(
             rc.read_text().replace(

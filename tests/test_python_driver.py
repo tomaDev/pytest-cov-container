@@ -20,16 +20,37 @@ def _make_build_dir(
     *,
     run_sh_content: str = "#!/bin/bash\necho user-app\n",
     with_pth: bool = True,
+    pth_layout: str = "flat",
 ) -> Path:
-    """Create a default-path-ready build_dir with run.sh and (optionally) a coverage*.pth."""
+    """Create a default-path-ready build_dir with run.sh and (optionally) a coverage*.pth.
+
+    pth_layout:
+      - "flat":      build_dir/coverage_subprocess.pth (`sam build` Python function)
+      - "pyver":     build_dir/python3.X/site-packages/coverage_subprocess.pth (Lambda layer)
+      - "nested":    build_dir/python/site-packages/coverage_subprocess.pth (one-level)
+    """
     (tmp_path / "run.sh").write_text(run_sh_content)
     (tmp_path / "run.sh").chmod(0o755)
     if with_pth:
-        sp = tmp_path / "site-packages"
-        sp.mkdir()
-        (sp / "coverage_subprocess.pth").write_text(
-            "import coverage; coverage.process_startup()\n"
-        )
+        if pth_layout == "flat":
+            pth = tmp_path / "coverage_subprocess.pth"
+        elif pth_layout == "pyver":
+            import sys
+
+            sp = (
+                tmp_path
+                / f"python{sys.version_info.major}.{sys.version_info.minor}"
+                / "site-packages"
+            )
+            sp.mkdir(parents=True)
+            pth = sp / "coverage_subprocess.pth"
+        elif pth_layout == "nested":
+            sp = tmp_path / "python" / "site-packages"
+            sp.mkdir(parents=True)
+            pth = sp / "coverage_subprocess.pth"
+        else:
+            raise ValueError(f"unknown pth_layout: {pth_layout}")
+        pth.write_text("import coverage; coverage.process_startup()\n")
     return tmp_path
 
 
@@ -61,7 +82,41 @@ class TestPythonDriverInject:
         assert "coverage.Coverage" in content
         assert "SIGUSR1" in content
         assert "CONTAINER_COV_ENTRYPOINT" in content
-        assert self.config.entrypoint in content
+        # Entrypoint is NOT baked into wrapper source. It now lives in a
+        # sidecar JSON file (see _cov_entrypoint.json below) so a hostile
+        # pyproject.toml cannot inject Python code via the entrypoint field.
+        assert self.config.entrypoint not in content
+
+    def test_writes_entrypoint_sidecar_json(self, tmp_path):
+        import json
+
+        self.driver.inject(tmp_path, self.config)
+        sidecar = tmp_path / "_cov_entrypoint.json"
+        assert sidecar.exists()
+        data = json.loads(sidecar.read_text())
+        assert data["entrypoint"] == self.config.entrypoint
+
+    def test_entrypoint_with_python_source_is_quoted_safely(self, tmp_path):
+        # Regression: a hostile pyproject.toml could previously inject
+        # arbitrary Python code via entrypoint = '"); import os; os.system("evil"); ("'
+        # Now the entrypoint is JSON-encoded, never interpolated into source.
+        import json
+
+        hostile = '"); import os; os.system("evil"); ("'
+        cfg = DriverConfig(
+            build_dir="build",
+            entrypoint=hostile,
+            path_mapping={},
+        )
+        self.driver.inject(tmp_path, cfg)
+        wrapper_src = (tmp_path / "_cov_wrapper.py").read_text()
+        # The hostile string must NOT appear in Python source.
+        assert "os.system" not in wrapper_src
+        # But it IS preserved verbatim in the sidecar (it's just a shell
+        # string from the user's perspective; sh -c will execute it,
+        # which is the user's intent for entrypoint).
+        sidecar = json.loads((tmp_path / "_cov_entrypoint.json").read_text())
+        assert sidecar["entrypoint"] == hostile
 
     def test_creates_run_sh(self, tmp_path):
         self.driver.inject(tmp_path, self.config)
@@ -75,18 +130,23 @@ class TestPythonDriverInject:
     def test_returns_injection_result(self, tmp_path):
         result = self.driver.inject(tmp_path, self.config)
         assert isinstance(result, InjectionResult)
-        assert len(result.files_written) == 3
+        # 4 files now: .coveragerc + _cov_wrapper.py + run.sh + _cov_entrypoint.json
+        assert len(result.files_written) == 4
         assert "COVERAGE_PROCESS_START" in result.env_vars
 
-    def test_entrypoint_baked_into_wrapper(self, tmp_path):
+    def test_entrypoint_in_sidecar_not_wrapper(self, tmp_path):
+        import json
+
         custom_config = DriverConfig(
             build_dir="build",
             entrypoint="gunicorn app:app -b 0.0.0.0:9000",
             path_mapping={},
         )
         self.driver.inject(tmp_path, custom_config)
-        content = (tmp_path / "_cov_wrapper.py").read_text()
-        assert "gunicorn app:app -b 0.0.0.0:9000" in content
+        wrapper_content = (tmp_path / "_cov_wrapper.py").read_text()
+        sidecar_data = json.loads((tmp_path / "_cov_entrypoint.json").read_text())
+        assert "gunicorn app:app -b 0.0.0.0:9000" not in wrapper_content
+        assert sidecar_data["entrypoint"] == "gunicorn app:app -b 0.0.0.0:9000"
 
 
 class TestPythonDriverCollect:
@@ -116,8 +176,39 @@ class TestPythonDriverCollect:
     def test_signals_running_container(self, tmp_path):
         mock_backend = MagicMock()
         mock_backend.extract_matching_files.return_value = []
+        mock_backend.file_signature.return_value = ""
         self.driver.collect(mock_backend, self.container_running, tmp_path, self.config)
         mock_backend.send_signal.assert_called_once_with("abc123")
+
+    @pytest.mark.filterwarnings("ignore:No coverage data found")
+    def test_polls_for_save_completion_on_running(self, tmp_path):
+        mock_backend = MagicMock()
+        mock_backend.extract_matching_files.return_value = []
+        mock_backend.file_signature.return_value = "1700000000.0"
+        self.driver.collect(mock_backend, self.container_running, tmp_path, self.config)
+        # Baseline captured before signal, then wait_for_save called with it.
+        mock_backend.file_signature.assert_called_once_with(
+            "abc123", "/tmp", ".coverage.container"
+        )
+        mock_backend.wait_for_save.assert_called_once_with(
+            "abc123", "/tmp", ".coverage.container", "1700000000.0"
+        )
+
+    def test_collect_does_not_sleep(self):
+        # Regression: collect() previously did time.sleep(1) regardless of
+        # save state. Now should poll for save completion via backend.
+        import inspect
+
+        src = inspect.getsource(PythonDriver.collect)
+        assert "time.sleep" not in src
+
+    @pytest.mark.filterwarnings("ignore:No coverage data found")
+    def test_skips_poll_for_stopped_container(self, tmp_path):
+        mock_backend = MagicMock()
+        mock_backend.extract_matching_files.return_value = []
+        self.driver.collect(mock_backend, self.container_stopped, tmp_path, self.config)
+        mock_backend.file_signature.assert_not_called()
+        mock_backend.wait_for_save.assert_not_called()
 
     @pytest.mark.filterwarnings("ignore:No coverage data found")
     def test_skips_signal_for_stopped_container(self, tmp_path):
@@ -292,8 +383,9 @@ class TestPythonDriverInjectShim:
 def _spawn_wrapper(
     tmp_path: Path, orig_run_sh: str, *, coveragerc_extra: str = ""
 ) -> "subprocess.Popen[bytes]":
-    """Render the shim wrapper into tmp_path with /var/task substituted, write
-    a custom `_orig_run.sh`, and spawn it as a subprocess. Returns the Popen.
+    """Render the shim wrapper into tmp_path, write a custom `_orig_run.sh`,
+    and spawn it as a subprocess. The wrapper self-locates via dirname of
+    __file__, so no path substitution is needed.
 
     Caller is responsible for sending signals and waiting on the process.
     """
@@ -307,9 +399,8 @@ def _spawn_wrapper(
     (tmp_path / "_orig_run.sh").write_text(orig_run_sh)
     (tmp_path / "_orig_run.sh").chmod(0o755)
 
-    wrapper_src = _COV_WRAPPER_TEMPLATE_SHIM.replace("/var/task", str(tmp_path))
     wrapper_path = tmp_path / "_cov_wrapper.py"
-    wrapper_path.write_text(wrapper_src)
+    wrapper_path.write_text(_COV_WRAPPER_TEMPLATE_SHIM)
 
     return subprocess.Popen(  # noqa: S603
         [sys.executable, str(wrapper_path)],
@@ -393,6 +484,52 @@ class TestCovWrapperSubprocessBehavior:
         assert env_dump.exists()
         # Wrapper sets COVERAGE_PROCESS_START via setdefault to <tmp>/.coveragerc
         assert env_dump.read_text().strip() == str(tmp_path / ".coveragerc")
+
+
+class TestFindCoveragePth:
+    """_find_coverage_pth uses direct probes (no recursive scan). Verify each
+    supported layout resolves and that misses return None."""
+
+    def test_finds_flat_layout(self, tmp_path):
+        from pytest_cov_container.drivers.python import _find_coverage_pth
+
+        _make_build_dir(tmp_path, pth_layout="flat")
+        result = _find_coverage_pth(tmp_path)
+        assert result is not None
+        assert result.name.startswith("coverage")
+
+    def test_finds_pyver_layout(self, tmp_path):
+        from pytest_cov_container.drivers.python import _find_coverage_pth
+
+        _make_build_dir(tmp_path, pth_layout="pyver")
+        result = _find_coverage_pth(tmp_path)
+        assert result is not None
+        assert "site-packages" in str(result)
+
+    def test_finds_nested_layout(self, tmp_path):
+        from pytest_cov_container.drivers.python import _find_coverage_pth
+
+        _make_build_dir(tmp_path, pth_layout="nested")
+        result = _find_coverage_pth(tmp_path)
+        assert result is not None
+        assert "site-packages" in str(result)
+
+    def test_returns_none_when_missing(self, tmp_path):
+        from pytest_cov_container.drivers.python import _find_coverage_pth
+
+        _make_build_dir(tmp_path, with_pth=False)
+        result = _find_coverage_pth(tmp_path)
+        assert result is None
+
+    def test_does_not_use_rglob(self):
+        # Regression: previous implementation used rglob which walked the
+        # entire build_dir tree (200-800ms warm cache for 60-120k stats on
+        # a real SAM build_dir). Now should be a bounded direct probe.
+        import inspect
+        from pytest_cov_container.drivers.python import _find_coverage_pth
+
+        src = inspect.getsource(_find_coverage_pth)
+        assert "rglob" not in src, "_find_coverage_pth should not use rglob"
 
 
 class TestCovWrapperTemplates:

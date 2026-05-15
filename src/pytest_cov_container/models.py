@@ -36,6 +36,20 @@ class DockerBackendProtocol(Protocol):
         dest: Path,
     ) -> list[Path]: ...
 
+    def file_signature(
+        self, container_id: str, source_dir: str, prefix: str
+    ) -> str: ...
+
+    def wait_for_save(
+        self,
+        container_id: str,
+        source_dir: str,
+        prefix: str,
+        baseline: str,
+        timeout: float = ...,
+        interval: float = ...,
+    ) -> bool: ...
+
 
 @runtime_checkable
 class LanguageDriver(Protocol):

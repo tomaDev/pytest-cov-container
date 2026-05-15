@@ -2,6 +2,7 @@ import subprocess
 import sys
 import tempfile
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,7 @@ import pytest_cov_container
 from pytest_cov_container import config as config_module
 from pytest_cov_container import drivers
 from pytest_cov_container.docker_backend import DockerBackend
+from pytest_cov_container.models import ContainerInfo
 from pytest_cov_container.resolver import SamBuildResolver
 
 
@@ -49,12 +51,42 @@ class ContainerCovPlugin:
                 stacklevel=2,
             )
 
-        for container in containers:
-            self.driver.collect(
-                self.backend, container, self.coverage_dir, self.config.driver_config
-            )
-
+        self._collect_concurrently(containers)
         self._combine_coverage(session.config.rootpath)
+
+    def _collect_concurrently(self, containers: list[ContainerInfo]) -> None:
+        """Run ``driver.collect`` per container on a small thread pool. Each
+        collect call does at least one round-trip to the docker daemon
+        (and the wait-for-save poll); fanning them out cuts session-finish
+        from O(N * RTT) to ~RTT for typical N. Failures in one container
+        don't block the rest — collect errors surface as warnings.
+        """
+        if not containers:
+            return
+        max_workers = min(8, len(containers))
+        cfg = self.config.driver_config
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            future_to_container = {
+                ex.submit(
+                    self.driver.collect,
+                    self.backend,
+                    container,
+                    self.coverage_dir,
+                    cfg,
+                ): container
+                for container in containers
+            }
+            for future in as_completed(future_to_container):
+                container = future_to_container[future]
+                try:
+                    future.result()
+                except Exception as exc:  # noqa: BLE001 — surface, don't crash
+                    warnings.warn(
+                        f"collect failed for container {container.name} "
+                        f"({container.id[:12]}): {exc}",
+                        UserWarning,
+                        stacklevel=2,
+                    )
 
     def collect_from_running(self):
         containers = self.backend.find_containers(
@@ -94,10 +126,11 @@ class ContainerCovPlugin:
             text=True,
         )
         if result.returncode != 0:
-            warnings.warn(
-                f"coverage combine failed: {result.stderr}",
-                UserWarning,
-                stacklevel=2,
+            stderr = (result.stderr or "").strip()
+            stdout = (result.stdout or "").strip()
+            detail = stderr or stdout or "(no diagnostic output)"
+            raise RuntimeError(
+                f"coverage combine failed (rc={result.returncode}): {detail}"
             )
 
 
@@ -129,4 +162,4 @@ def pytest_configure(config):
 
     plugin = ContainerCovPlugin(plugin_config)
     config.pluginmanager.register(plugin, "cov_container")
-    pytest_cov_container._active_plugin = plugin  # noqa: SLF001
+    pytest_cov_container._register_active_plugin(plugin)

@@ -1,7 +1,7 @@
 import logging
 import shutil
 import stat
-import time
+import sys
 import warnings
 from pathlib import Path
 
@@ -33,10 +33,16 @@ import subprocess
 
 import coverage
 
+# Self-locate: build_dir is wherever this wrapper sits. On Lambda that's
+# /var/task; on non-SAM deployments it may be anywhere. Computing the
+# path at runtime removes the Lambda assumption and makes the wrapper
+# portable (and trivially testable).
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
 # Propagate COVERAGE_PROCESS_START to child subprocess Python interpreters so
 # subprocess coverage activates via coverage.process_startup() in each child.
 # setdefault, not assignment: respect any caller-supplied override.
-os.environ.setdefault("COVERAGE_PROCESS_START", "/var/task/.coveragerc")
+os.environ.setdefault("COVERAGE_PROCESS_START", os.path.join(_HERE, ".coveragerc"))
 
 cov = coverage.Coverage(config_file=os.environ["COVERAGE_PROCESS_START"])
 cov.start()
@@ -71,7 +77,7 @@ def _save_and_forward(signum, _frame):
 signal.signal(signal.SIGUSR1, _save)
 signal.signal(signal.SIGTERM, _save_and_forward)
 
-proc = subprocess.Popen(["bash", "/var/task/_orig_run.sh"])
+proc = subprocess.Popen(["bash", os.path.join(_HERE, "_orig_run.sh")])
 rc = proc.wait()
 cov.stop()
 cov.save()
@@ -79,14 +85,27 @@ raise SystemExit(rc)
 """
 
 _COV_WRAPPER_TEMPLATE_LEGACY = """\
+import json
 import os
 import signal
 import subprocess
 
 import coverage
 
+# Self-locate (see comment in shim template).
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+# Entrypoint is read from a sidecar JSON file at runtime, not interpolated
+# into this source. This eliminates a two-layer injection (CWE-94 + CWE-78)
+# that previously existed when `_inject_legacy` did `template.format(
+# entrypoint=cfg.entrypoint)` and a hostile pyproject.toml could plant
+# Python source in the wrapper.
+with open(os.path.join(_HERE, "_cov_entrypoint.json")) as _f:
+    _entrypoint_data = json.load(_f)
+_entrypoint = _entrypoint_data["entrypoint"]
+
 cov = coverage.Coverage(
-    config_file=os.environ.get("COVERAGE_PROCESS_START", "/var/task/.coveragerc")
+    config_file=os.environ.get("COVERAGE_PROCESS_START", os.path.join(_HERE, ".coveragerc"))
 )
 cov.start()
 
@@ -107,7 +126,7 @@ signal.signal(signal.SIGUSR1, _save)
 signal.signal(signal.SIGTERM, _save_and_forward)
 
 proc = subprocess.Popen(
-    ["sh", "-c", os.environ.get("CONTAINER_COV_ENTRYPOINT", "{entrypoint}")]
+    ["sh", "-c", os.environ.get("CONTAINER_COV_ENTRYPOINT", _entrypoint)]
 )
 rc = proc.wait()
 cov.stop()
@@ -117,7 +136,10 @@ raise SystemExit(rc)
 
 _RUN_SH_TEMPLATE = """\
 #!/bin/bash
-exec python /var/task/_cov_wrapper.py
+# Self-locating shim: invoke the wrapper next to this script, whatever
+# directory the container has mounted us at. Removes the Lambda-only
+# `/var/task` assumption.
+exec python "$(cd "$(dirname "$0")" && pwd)/_cov_wrapper.py"
 """
 
 
@@ -130,12 +152,49 @@ def _is_shim(run_sh: Path) -> bool:
 
 
 def _find_coverage_pth(build_dir: Path) -> Path | None:
-    for sp in build_dir.rglob("site-packages"):
-        if not sp.is_dir():
-            continue
-        matches = list(sp.glob("coverage*.pth"))
-        if matches:
-            return matches[0]
+    """Locate coverage's subprocess `.pth` file in a SAM-style build_dir.
+
+    Direct probes against the conventional layouts — no recursive scan, since
+    a real SAM build_dir routinely holds 60k-120k files and a warm-cache
+    recursive walk runs 200-800ms. Three probe shapes cover every layout
+    we've seen in production:
+
+    1. ``<build_dir>/coverage*.pth``               — flat function build
+       (`sam build` Python function; pip installs deps at the build root).
+    2. ``<build_dir>/python{X.Y}/site-packages/`` — Lambda layer style.
+    3. ``<build_dir>/*/site-packages/``           — one-level fallback for
+       unusual layouts (containers, vendored bundles, etc.).
+    """
+    # 1. Flat function build (sam build Python function planted at root).
+    direct = list(build_dir.glob("coverage*.pth"))
+    if direct:
+        return direct[0]
+    # 1b. Direct site-packages subdir under build_dir.
+    direct_sp = build_dir / "site-packages"
+    if direct_sp.is_dir():
+        hits = list(direct_sp.glob("coverage*.pth"))
+        if hits:
+            return hits[0]
+    # 2. Versioned site-packages. Try the host's Python first (most likely
+    #    match for a `sam build` run on the same host), then the small set
+    #    of versions Lambda currently supports.
+    candidates = [f"python{sys.version_info.major}.{sys.version_info.minor}"]
+    candidates += [
+        f"python3.{v}"
+        for v in (15, 14, 13, 12, 11, 10, 9)
+        if f"python3.{v}" not in candidates
+    ]
+    for pyver in candidates:
+        sp = build_dir / pyver / "site-packages"
+        if sp.is_dir():
+            hits = list(sp.glob("coverage*.pth"))
+            if hits:
+                return hits[0]
+    # 3. One-level fallback for non-versioned layouts (e.g. `python/`).
+    for sp in build_dir.glob("*/site-packages"):
+        hits = list(sp.glob("coverage*.pth"))
+        if hits:
+            return hits[0]
     return None
 
 
@@ -204,6 +263,8 @@ def _inject_shim(target_dir: Path, config: DriverConfig) -> InjectionResult:  # 
 
 
 def _inject_legacy(target_dir: Path, config: DriverConfig) -> InjectionResult:
+    import json
+
     orig = target_dir / "_orig_run.sh"
     if orig.exists():
         logger.debug("override path: unlinking stale _orig_run.sh at %s", orig)
@@ -215,10 +276,16 @@ def _inject_legacy(target_dir: Path, config: DriverConfig) -> InjectionResult:
     coveragerc.write_text(_COVERAGERC_TEMPLATE)
     files.append(coveragerc)
 
+    # Entrypoint is written to a sidecar JSON file and loaded by the wrapper
+    # at runtime, rather than interpolated into the wrapper's Python source.
+    # Prevents code-injection attacks via a hostile `entrypoint` value in
+    # pyproject.toml (CWE-94 + CWE-78).
+    entrypoint_json = target_dir / "_cov_entrypoint.json"
+    entrypoint_json.write_text(json.dumps({"entrypoint": config.entrypoint}))
+    files.append(entrypoint_json)
+
     wrapper = target_dir / "_cov_wrapper.py"
-    wrapper.write_text(
-        _COV_WRAPPER_TEMPLATE_LEGACY.format(entrypoint=config.entrypoint)
-    )
+    wrapper.write_text(_COV_WRAPPER_TEMPLATE_LEGACY)
     files.append(wrapper)
 
     run_sh = target_dir / "run.sh"
@@ -248,8 +315,22 @@ class PythonDriver:
         config: DriverConfig,  # noqa: ARG002
     ) -> Path:
         if container.status == "running":
+            # Capture pre-signal file signature, send SIGUSR1, then poll for
+            # the wrapper's cov.save() to land (replaces the legacy fixed
+            # 1-second sleep that both wasted ~1s on fast hosts and racing
+            # on slow ones).
+            baseline = docker_backend.file_signature(
+                container.id,
+                "/tmp",  # noqa: S108
+                ".coverage.container",
+            )
             docker_backend.send_signal(container.id)
-            time.sleep(1)
+            docker_backend.wait_for_save(
+                container.id,
+                "/tmp",  # noqa: S108
+                ".coverage.container",
+                baseline,
+            )
 
         extracted = docker_backend.extract_matching_files(
             container.id,
