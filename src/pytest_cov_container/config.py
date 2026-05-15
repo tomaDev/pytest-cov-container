@@ -27,7 +27,9 @@ def load_config(pyproject_path: Path) -> PluginConfig | None:
     if tool_config is None:
         return None
 
-    path_mapping = {str(k): str(v) for k, v in tool_config.get("path_mapping", {}).items()}
+    path_mapping = {
+        str(k): str(v) for k, v in tool_config.get("path_mapping", {}).items()
+    }
 
     plugin_config = PluginConfig(
         image_pattern=tool_config.get("image_pattern"),
@@ -38,9 +40,15 @@ def load_config(pyproject_path: Path) -> PluginConfig | None:
     )
 
     driver_section = tool_config.get(plugin_config.language, {})
+    entrypoint = driver_section.get("entrypoint")
+    if entrypoint == "":
+        raise ValueError(
+            "[tool.pytest-cov-container.python].entrypoint is empty. "
+            "Remove the field to use convention discovery, or set a non-empty command."
+        )
     plugin_config.driver_config = DriverConfig(
         build_dir=driver_section.get("build_dir", ".aws-sam/build/ApiFunction"),
-        entrypoint=driver_section.get("entrypoint", "uvicorn app:app --host 0.0.0.0 --port 8080"),
+        entrypoint=entrypoint,
         path_mapping=path_mapping,
     )
 

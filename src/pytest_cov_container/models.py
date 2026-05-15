@@ -15,8 +15,8 @@ class ContainerInfo:
 @dataclass
 class DriverConfig:
     build_dir: str
-    entrypoint: str
-    path_mapping: dict[str, str]
+    entrypoint: str | None = None
+    path_mapping: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass

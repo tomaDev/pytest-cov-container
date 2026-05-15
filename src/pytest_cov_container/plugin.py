@@ -31,7 +31,9 @@ class ContainerCovPlugin:
             msg = f"Build directory {target_dir} does not exist. Run 'sam build' before running tests."
             raise FileNotFoundError(msg)
 
-        self.injection_result = self.driver.inject(target_dir, self.config.driver_config)
+        self.injection_result = self.driver.inject(
+            target_dir, self.config.driver_config
+        )
 
     @pytest.hookimpl(trylast=True)
     def pytest_sessionfinish(self, session, exitstatus):  # noqa: ARG002
@@ -48,7 +50,9 @@ class ContainerCovPlugin:
             )
 
         for container in containers:
-            self.driver.collect(self.backend, container, self.coverage_dir, self.config.driver_config)
+            self.driver.collect(
+                self.backend, container, self.coverage_dir, self.config.driver_config
+            )
 
         self._combine_coverage(session.config.rootpath)
 
@@ -59,12 +63,16 @@ class ContainerCovPlugin:
         )
         running = [c for c in containers if c.status == "running"]
         for container in running:
-            self.driver.collect(self.backend, container, self.coverage_dir, self.config.driver_config)
+            self.driver.collect(
+                self.backend, container, self.coverage_dir, self.config.driver_config
+            )
 
     def _combine_coverage(self, root: Path):
         rc_path = self.coverage_dir / ".coveragerc"
         lines = ["[paths]"]
-        for i, (host_path, container_path) in enumerate(self.config.path_mapping.items()):
+        for i, (host_path, container_path) in enumerate(
+            self.config.path_mapping.items()
+        ):
             label = "source" if i == 0 else f"source{i}"
             lines.append(f"{label} =")
             lines.append(f"    {host_path}")
@@ -72,7 +80,14 @@ class ContainerCovPlugin:
         rc_path.write_text("\n".join(lines) + "\n")
 
         result = subprocess.run(
-            [sys.executable, "-m", "coverage", "combine", f"--rcfile={rc_path}", str(self.coverage_dir)],
+            [
+                sys.executable,
+                "-m",
+                "coverage",
+                "combine",
+                f"--rcfile={rc_path}",
+                str(self.coverage_dir),
+            ],
             check=False,
             cwd=root,
             capture_output=True,

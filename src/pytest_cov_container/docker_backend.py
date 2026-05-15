@@ -36,7 +36,11 @@ class DockerBackend:
 
         if image_pattern:
             containers = [
-                c for c in containers if any(fnmatch.fnmatch(tag, image_pattern) for tag in (c.image.tags or []))
+                c
+                for c in containers
+                if any(
+                    fnmatch.fnmatch(tag, image_pattern) for tag in (c.image.tags or [])
+                )
             ]
 
         return [self._to_info(c) for c in containers]

@@ -8,7 +8,9 @@ class TestFindContainers:
     def test_finds_by_label(self, mock_docker_client, mock_docker_container):
         backend = DockerBackend(client=mock_docker_client)
         containers = backend.find_containers(label="pytest-cov-container")
-        mock_docker_client.containers.list.assert_called_once_with(all=True, filters={"label": "pytest-cov-container"})
+        mock_docker_client.containers.list.assert_called_once_with(
+            all=True, filters={"label": "pytest-cov-container"}
+        )
         assert len(containers) == 1
         assert containers[0].id == mock_docker_container.id
 
@@ -28,7 +30,9 @@ class TestFindContainers:
         containers = backend.find_containers(label="nonexistent")
         assert containers == []
 
-    def test_handles_container_without_image_tags(self, mock_docker_client, mock_docker_container):
+    def test_handles_container_without_image_tags(
+        self, mock_docker_client, mock_docker_container
+    ):
         mock_docker_container.image.tags = []
         backend = DockerBackend(client=mock_docker_client)
         containers = backend.find_containers(image_pattern="samcli*")
@@ -36,7 +40,9 @@ class TestFindContainers:
 
 
 class TestSendSignal:
-    def test_sends_sigusr1_via_proc_walk(self, mock_docker_client, mock_docker_container):
+    def test_sends_sigusr1_via_proc_walk(
+        self, mock_docker_client, mock_docker_container
+    ):
         backend = DockerBackend(client=mock_docker_client)
         backend.send_signal(mock_docker_container.id)
         mock_docker_container.exec_run.assert_called_once()
@@ -56,7 +62,9 @@ class TestExtractMatchingFiles:
                 tar.addfile(info, io.BytesIO(content))
         return buf.getvalue()
 
-    def test_extracts_matching_files(self, mock_docker_client, mock_docker_container, tmp_path):
+    def test_extracts_matching_files(
+        self, mock_docker_client, mock_docker_container, tmp_path
+    ):
         tar_data = self._make_tar_bytes(
             {
                 "tmp/.coverage.container.host.123.abc": b"cov-data-1",
@@ -67,16 +75,24 @@ class TestExtractMatchingFiles:
         mock_docker_container.get_archive.return_value = (iter([tar_data]), {})
         backend = DockerBackend(client=mock_docker_client)
 
-        extracted = backend.extract_matching_files(mock_docker_container.id, "/tmp", ".coverage.container", tmp_path)
+        extracted = backend.extract_matching_files(
+            mock_docker_container.id, "/tmp", ".coverage.container", tmp_path
+        )
 
         assert len(extracted) == 2
         assert all(p.exists() for p in extracted)
-        assert (tmp_path / ".coverage.container.host.123.abc").read_bytes() == b"cov-data-1"
+        assert (
+            tmp_path / ".coverage.container.host.123.abc"
+        ).read_bytes() == b"cov-data-1"
 
-    def test_returns_empty_when_no_match(self, mock_docker_client, mock_docker_container, tmp_path):
+    def test_returns_empty_when_no_match(
+        self, mock_docker_client, mock_docker_container, tmp_path
+    ):
         tar_data = self._make_tar_bytes({"tmp/unrelated.txt": b"data"})
         mock_docker_container.get_archive.return_value = (iter([tar_data]), {})
         backend = DockerBackend(client=mock_docker_client)
 
-        extracted = backend.extract_matching_files(mock_docker_container.id, "/tmp", ".coverage.container", tmp_path)
+        extracted = backend.extract_matching_files(
+            mock_docker_container.id, "/tmp", ".coverage.container", tmp_path
+        )
         assert extracted == []
