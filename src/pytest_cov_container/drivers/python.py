@@ -1,3 +1,4 @@
+import json
 import logging
 import shutil
 import stat
@@ -177,13 +178,14 @@ def _find_coverage_pth(build_dir: Path) -> Path | None:
             return hits[0]
     # 2. Versioned site-packages. Try the host's Python first (most likely
     #    match for a `sam build` run on the same host), then the small set
-    #    of versions Lambda currently supports.
-    candidates = [f"python{sys.version_info.major}.{sys.version_info.minor}"]
-    candidates += [
-        f"python3.{v}"
-        for v in (15, 14, 13, 12, 11, 10, 9)
-        if f"python3.{v}" not in candidates
-    ]
+    #    of versions Lambda currently supports. dict.fromkeys preserves
+    #    order and dedups the host version if it's already in the fallback list.
+    host_ver = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    candidates = list(
+        dict.fromkeys(
+            [host_ver, *(f"python3.{v}" for v in (15, 14, 13, 12, 11, 10, 9))]
+        )
+    )
     for pyver in candidates:
         sp = build_dir / pyver / "site-packages"
         if sp.is_dir():
@@ -263,8 +265,6 @@ def _inject_shim(target_dir: Path, config: DriverConfig) -> InjectionResult:  # 
 
 
 def _inject_legacy(target_dir: Path, config: DriverConfig) -> InjectionResult:
-    import json
-
     orig = target_dir / "_orig_run.sh"
     if orig.exists():
         logger.debug("override path: unlinking stale _orig_run.sh at %s", orig)
@@ -317,20 +317,23 @@ class PythonDriver:
         if container.status == "running":
             # Capture pre-signal file signature, send SIGUSR1, then poll for
             # the wrapper's cov.save() to land (replaces the legacy fixed
-            # 1-second sleep that both wasted ~1s on fast hosts and racing
-            # on slow ones).
+            # 1-second sleep that both wasted ~1s on fast hosts and raced
+            # on slow ones). Skip the poll if send_signal reports zero
+            # wrappers found — nothing to wait for, and a remote daemon
+            # spins ~2 s × N containers of pointless RTTs otherwise.
             baseline = docker_backend.file_signature(
                 container.id,
                 "/tmp",  # noqa: S108
                 ".coverage.container",
             )
-            docker_backend.send_signal(container.id)
-            docker_backend.wait_for_save(
-                container.id,
-                "/tmp",  # noqa: S108
-                ".coverage.container",
-                baseline,
-            )
+            signalled = docker_backend.send_signal(container.id)
+            if signalled > 0:
+                docker_backend.wait_for_save(
+                    container.id,
+                    "/tmp",  # noqa: S108
+                    ".coverage.container",
+                    baseline,
+                )
 
         extracted = docker_backend.extract_matching_files(
             container.id,

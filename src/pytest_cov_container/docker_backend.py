@@ -1,5 +1,7 @@
 import fnmatch
 import io
+import re
+import shlex
 import tarfile
 import time
 import warnings
@@ -9,6 +11,8 @@ import docker
 import docker.errors
 
 from pytest_cov_container.models import ContainerInfo
+
+_SIGNALLED_RE = re.compile(rb"signalled=(\d+)")
 
 # PEP 706 data filter — present on 3.12+, polyfilled below for 3.11.
 _tarfile_data_filter = getattr(tarfile, "data_filter", None)
@@ -82,7 +86,10 @@ class DockerBackend:
 
         return [self._to_info(c) for c in containers]
 
-    def send_signal(self, container_id: str) -> None:
+    def send_signal(self, container_id: str) -> int:
+        """Signal all wrapper processes in the container with SIGUSR1.
+        Returns the number signalled (0 if no wrapper found; -1 on docker
+        API error). Callers can use the count to skip downstream waits."""
         try:
             container = self._client.containers.get(container_id)
             exit_code, output = container.exec_run(_SIGNAL_CMD)
@@ -92,22 +99,12 @@ class DockerBackend:
                 UserWarning,
                 stacklevel=2,
             )
-            return
+            return -1
 
-        # Parse `signalled=N` line from the shell loop. N=0 means no wrapper
-        # process was found inside the container — almost always means the
-        # injection step ran against the wrong build_dir or the container
-        # didn't actually start the wrapper. Surface loudly rather than
-        # silently producing an empty coverage extract.
-        signalled = 0
-        if output:
-            for line in output.decode("utf-8", errors="replace").splitlines():
-                if line.startswith("signalled="):
-                    try:
-                        signalled = int(line.split("=", 1)[1])
-                    except ValueError:
-                        pass
-                    break
+        # N=0 means no wrapper found — surface loudly, the coverage extract
+        # will be empty.
+        match = _SIGNALLED_RE.search(output or b"")
+        signalled = int(match.group(1)) if match else 0
         if signalled == 0:
             warnings.warn(
                 f"Container {container_id[:12]}: no wrapper process found "
@@ -115,6 +112,7 @@ class DockerBackend:
                 UserWarning,
                 stacklevel=2,
             )
+        return signalled
 
     def extract_matching_files(
         self,
@@ -154,20 +152,28 @@ class DockerBackend:
         container = self._client.containers.get(container_id)
         return container.attrs
 
+    @staticmethod
+    def _signature_cmd(source_dir: str, prefix: str) -> list[str]:
+        # shlex.quote both arguments — they reach a shell via `sh -c`, and
+        # while the plugin's own caller passes safe constants today
+        # (`/tmp` / `.coveragerc.container`), nothing structurally prevents
+        # a future caller from passing user input. Defense-in-depth.
+        return [
+            "sh",
+            "-c",
+            f"find {shlex.quote(source_dir)} -maxdepth 1 "
+            f"-name {shlex.quote(prefix + '*')} -printf '%T@\\n' "
+            "2>/dev/null | sort -rn | head -1",
+        ]
+
     def file_signature(self, container_id: str, source_dir: str, prefix: str) -> str:
         """Return the mtime of the newest file in `source_dir` whose name
         starts with `prefix`, formatted as a string. Empty string if no
         matching file or on docker error. Used as a baseline by
         `wait_for_save` to detect new save activity."""
-        cmd = [
-            "sh",
-            "-c",
-            f"find {source_dir} -maxdepth 1 -name '{prefix}*' "
-            f"-printf '%T@\\n' 2>/dev/null | sort -rn | head -1",
-        ]
         try:
             container = self._client.containers.get(container_id)
-            _, output = container.exec_run(cmd)
+            _, output = container.exec_run(self._signature_cmd(source_dir, prefix))
         except docker.errors.APIError:
             return ""
         if not output:
@@ -187,10 +193,26 @@ class DockerBackend:
         differs from `baseline`, OR `timeout` seconds elapse. Returns True
         if a change was observed. Replaces the legacy 1-second blanket
         sleep: real coverage.save() takes 1-20 ms, so this returns in
-        ~50 ms on the common path and caps wasted time on the slow path."""
+        ~50 ms on the common path and caps wasted time on the slow path.
+
+        Hoists `containers.get` out of the poll loop — each iteration on a
+        remote daemon would otherwise pay 2 RTTs (one for `get`, one for
+        `exec_run`). One per call means ~50 ms cycles are actually 50 ms
+        instead of 100-200 ms.
+        """
+        try:
+            container = self._client.containers.get(container_id)
+        except docker.errors.APIError:
+            return False
+        cmd = self._signature_cmd(source_dir, prefix)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if self.file_signature(container_id, source_dir, prefix) != baseline:
+            try:
+                _, output = container.exec_run(cmd)
+            except docker.errors.APIError:
+                return False
+            sig = output.decode("utf-8", errors="replace").strip() if output else ""
+            if sig != baseline:
                 return True
             time.sleep(interval)
         return False

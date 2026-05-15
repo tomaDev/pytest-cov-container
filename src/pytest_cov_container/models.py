@@ -26,7 +26,7 @@ class InjectionResult:
 
 
 class DockerBackendProtocol(Protocol):
-    def send_signal(self, container_id: str) -> None: ...
+    def send_signal(self, container_id: str) -> int: ...
 
     def extract_matching_files(
         self,

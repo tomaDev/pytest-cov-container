@@ -177,6 +177,7 @@ class TestPythonDriverCollect:
         mock_backend = MagicMock()
         mock_backend.extract_matching_files.return_value = []
         mock_backend.file_signature.return_value = ""
+        mock_backend.send_signal.return_value = 1
         self.driver.collect(mock_backend, self.container_running, tmp_path, self.config)
         mock_backend.send_signal.assert_called_once_with("abc123")
 
@@ -185,6 +186,7 @@ class TestPythonDriverCollect:
         mock_backend = MagicMock()
         mock_backend.extract_matching_files.return_value = []
         mock_backend.file_signature.return_value = "1700000000.0"
+        mock_backend.send_signal.return_value = 1  # one wrapper signalled
         self.driver.collect(mock_backend, self.container_running, tmp_path, self.config)
         # Baseline captured before signal, then wait_for_save called with it.
         mock_backend.file_signature.assert_called_once_with(
@@ -193,6 +195,18 @@ class TestPythonDriverCollect:
         mock_backend.wait_for_save.assert_called_once_with(
             "abc123", "/tmp", ".coverage.container", "1700000000.0"
         )
+
+    @pytest.mark.filterwarnings("ignore:No coverage data found")
+    def test_skips_poll_when_no_wrapper_signalled(self, tmp_path):
+        # send_signal=0 means no wrapper in the container; no save will
+        # land, so polling would burn the full 2s timeout fruitlessly.
+        mock_backend = MagicMock()
+        mock_backend.extract_matching_files.return_value = []
+        mock_backend.file_signature.return_value = ""
+        mock_backend.send_signal.return_value = 0
+        self.driver.collect(mock_backend, self.container_running, tmp_path, self.config)
+        mock_backend.send_signal.assert_called_once_with("abc123")
+        mock_backend.wait_for_save.assert_not_called()
 
     def test_collect_does_not_sleep(self):
         # Regression: collect() previously did time.sleep(1) regardless of
