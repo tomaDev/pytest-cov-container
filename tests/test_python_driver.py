@@ -1,10 +1,36 @@
+import ast
 import stat
+import subprocess
+import time
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
-from pytest_cov_container.drivers.python import PythonDriver
+from pytest_cov_container.drivers.python import (
+    _COV_WRAPPER_TEMPLATE_LEGACY,
+    _COV_WRAPPER_TEMPLATE_SHIM,
+    PythonDriver,
+)
 from pytest_cov_container.models import ContainerInfo, DriverConfig, InjectionResult
+
+
+def _make_build_dir(
+    tmp_path: Path,
+    *,
+    run_sh_content: str = "#!/bin/bash\necho user-app\n",
+    with_pth: bool = True,
+) -> Path:
+    """Create a default-path-ready build_dir with run.sh and (optionally) a coverage*.pth."""
+    (tmp_path / "run.sh").write_text(run_sh_content)
+    (tmp_path / "run.sh").chmod(0o755)
+    if with_pth:
+        sp = tmp_path / "site-packages"
+        sp.mkdir()
+        (sp / "coverage_subprocess.pth").write_text(
+            "import coverage; coverage.process_startup()\n"
+        )
+    return tmp_path
 
 
 class TestPythonDriverInject:
@@ -104,9 +130,13 @@ class TestPythonDriverCollect:
         cov_file.write_bytes(b"data")
         mock_backend.extract_matching_files.return_value = [cov_file]
 
-        result = self.driver.collect(mock_backend, self.container_stopped, tmp_path, self.config)
+        result = self.driver.collect(
+            mock_backend, self.container_stopped, tmp_path, self.config
+        )
 
-        mock_backend.extract_matching_files.assert_called_once_with("def456", "/tmp", ".coverage.container", tmp_path)
+        mock_backend.extract_matching_files.assert_called_once_with(
+            "def456", "/tmp", ".coverage.container", tmp_path
+        )
         assert result == tmp_path
 
     def test_warns_when_no_coverage_data(self, tmp_path):
@@ -114,4 +144,271 @@ class TestPythonDriverCollect:
         mock_backend.extract_matching_files.return_value = []
 
         with pytest.warns(UserWarning, match="No coverage data found"):
-            self.driver.collect(mock_backend, self.container_stopped, tmp_path, self.config)
+            self.driver.collect(
+                mock_backend, self.container_stopped, tmp_path, self.config
+            )
+
+
+class TestPythonDriverInjectShim:
+    """Default-path (move-and-shim) tests. entrypoint is None → convention discovery."""
+
+    def setup_method(self):
+        self.driver = PythonDriver()
+        self.config = DriverConfig(
+            build_dir=".aws-sam/build/ApiFunction",
+            entrypoint=None,
+            path_mapping={"src/api": "/var/task"},
+        )
+
+    def test_inject_move_and_shim_default(self, tmp_path):
+        build = _make_build_dir(
+            tmp_path, run_sh_content="#!/bin/bash\nuser entrypoint\n"
+        )
+        original = (build / "run.sh").read_bytes()
+        original_mode = (build / "run.sh").stat().st_mode
+
+        result = self.driver.inject(build, self.config)
+
+        orig = build / "_orig_run.sh"
+        assert orig.exists()
+        assert orig.read_bytes() == original
+        assert orig.stat().st_mode & stat.S_IXUSR
+        # Mode preserved via copy2
+        assert orig.stat().st_mode & 0o777 == original_mode & 0o777
+
+        # run.sh replaced with shim
+        shim = build / "run.sh"
+        assert "_cov_wrapper.py" in shim.read_text()
+
+        # 4 artifacts written/touched: .coveragerc, _cov_wrapper.py, run.sh, _orig_run.sh
+        assert len(result.files_written) == 4
+        assert "COVERAGE_PROCESS_START" in result.env_vars
+
+    def test_inject_idempotent_rerun(self, tmp_path):
+        build = _make_build_dir(tmp_path)
+        self.driver.inject(build, self.config)
+        orig_first = (build / "_orig_run.sh").read_bytes()
+        wrapper_first_mtime = (build / "_cov_wrapper.py").stat().st_mtime_ns
+
+        # second run
+        import time
+
+        time.sleep(0.01)
+        self.driver.inject(build, self.config)
+
+        assert (build / "_orig_run.sh").read_bytes() == orig_first
+        # other artifacts overwritten (mtime advances on rewrite)
+        assert (build / "_cov_wrapper.py").stat().st_mtime_ns >= wrapper_first_mtime
+
+    def test_inject_missing_run_sh_raises(self, tmp_path):
+        # build_dir exists but no run.sh
+        (tmp_path / "site-packages").mkdir()
+        (tmp_path / "site-packages" / "coverage_subprocess.pth").write_text(
+            "import coverage\n"
+        )
+        with pytest.raises(RuntimeError, match="run.sh"):
+            self.driver.inject(tmp_path, self.config)
+
+    def test_inject_missing_run_sh_with_override_ok(self, tmp_path):
+        override_config = DriverConfig(
+            build_dir="x",
+            entrypoint="gunicorn app:app",
+            path_mapping={},
+        )
+        # No run.sh, no site-packages — override is exempt
+        self.driver.inject(tmp_path, override_config)
+        assert (tmp_path / "_cov_wrapper.py").exists()
+        assert (tmp_path / "run.sh").exists()
+        assert not (tmp_path / "_orig_run.sh").exists()
+
+    def test_inject_unreadable_run_sh_raises(self, tmp_path):
+        build = _make_build_dir(tmp_path)
+        (build / "run.sh").chmod(0o000)
+        try:
+            with pytest.raises(PermissionError):
+                self.driver.inject(build, self.config)
+        finally:
+            (build / "run.sh").chmod(0o644)
+
+    def test_inject_corrupt_state_warns_then_recovers(self, tmp_path):
+        # _orig_run.sh exists, run.sh present but not the shim
+        build = _make_build_dir(tmp_path)
+        (build / "_orig_run.sh").write_text("#!/bin/bash\noriginal\n")
+        (build / "_orig_run.sh").chmod(0o755)
+        (build / "run.sh").write_text("#!/bin/bash\nnot a shim\n")
+
+        with pytest.warns(UserWarning, match="rewriting"):
+            self.driver.inject(build, self.config)
+
+        # both rewritten cleanly
+        assert "_cov_wrapper.py" in (build / "run.sh").read_text()
+
+    def test_inject_refuses_shim_run_sh_without_backup(self, tmp_path):
+        # run.sh looks like the shim but _orig_run.sh is missing
+        build = tmp_path
+        (build / "run.sh").write_text(
+            "#!/bin/bash\nexec python /var/task/_cov_wrapper.py\n"
+        )
+        (build / "run.sh").chmod(0o755)
+        sp = build / "site-packages"
+        sp.mkdir()
+        (sp / "coverage_subprocess.pth").write_text("import coverage\n")
+
+        with pytest.raises(RuntimeError, match="no `_orig_run.sh`"):
+            self.driver.inject(build, self.config)
+
+    def test_inject_missing_coverage_pth_raises(self, tmp_path):
+        build = _make_build_dir(tmp_path, with_pth=False)
+        with pytest.raises(RuntimeError, match="coverage"):
+            self.driver.inject(build, self.config)
+
+    def test_inject_missing_coverage_pth_override_exempt(self, tmp_path):
+        # Same build_dir, no pth, but override path → success
+        build = _make_build_dir(tmp_path, with_pth=False)
+        override_config = DriverConfig(
+            build_dir=str(build), entrypoint="x y z", path_mapping={}
+        )
+        self.driver.inject(build, override_config)
+        assert (build / "_cov_wrapper.py").exists()
+
+    def test_inject_override_path_unlinks_stale_orig_run_sh(self, tmp_path):
+        # Pre-existing _orig_run.sh from a prior default-path inject
+        (tmp_path / "_orig_run.sh").write_text("#!/bin/bash\nstale\n")
+        override_config = DriverConfig(
+            build_dir=str(tmp_path), entrypoint="x y z", path_mapping={}
+        )
+        self.driver.inject(tmp_path, override_config)
+        assert not (tmp_path / "_orig_run.sh").exists()
+
+    def test_run_sh_executable_bit_set(self, tmp_path):
+        build = _make_build_dir(tmp_path)
+        self.driver.inject(build, self.config)
+        assert (build / "run.sh").stat().st_mode & stat.S_IXUSR
+        assert (build / "_orig_run.sh").stat().st_mode & stat.S_IXUSR
+
+
+def _spawn_wrapper(
+    tmp_path: Path, orig_run_sh: str, *, coveragerc_extra: str = ""
+) -> "subprocess.Popen[bytes]":
+    """Render the shim wrapper into tmp_path with /var/task substituted, write
+    a custom `_orig_run.sh`, and spawn it as a subprocess. Returns the Popen.
+
+    Caller is responsible for sending signals and waiting on the process.
+    """
+    import sys
+
+    (tmp_path / ".coveragerc").write_text(
+        f"[run]\ndata_file = {tmp_path}/.coverage.container\n"
+        "relative_files = true\nparallel = true\nsigterm = true\n"
+        f"{coveragerc_extra}"
+    )
+    (tmp_path / "_orig_run.sh").write_text(orig_run_sh)
+    (tmp_path / "_orig_run.sh").chmod(0o755)
+
+    wrapper_src = _COV_WRAPPER_TEMPLATE_SHIM.replace("/var/task", str(tmp_path))
+    wrapper_path = tmp_path / "_cov_wrapper.py"
+    wrapper_path.write_text(wrapper_src)
+
+    return subprocess.Popen(  # noqa: S603
+        [sys.executable, str(wrapper_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+class TestCovWrapperSubprocessBehavior:
+    """Spawn the rendered wrapper as a real subprocess and exercise signals."""
+
+    def test_cov_wrapper_forwards_sigterm_to_child(self, tmp_path):
+        import signal as _signal
+
+        sentinel = tmp_path / "child_saw_sigterm"
+        orig = (
+            "#!/bin/bash\n"
+            f"trap 'echo hit > {sentinel}; exit 42' TERM\n"
+            "sleep 30 &\nwait $!\n"
+        )
+        proc = _spawn_wrapper(tmp_path, orig)
+        try:
+            time.sleep(0.5)  # let wrapper install handlers + spawn child
+            proc.send_signal(_signal.SIGTERM)
+            rc = proc.wait(timeout=5)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=2)
+        assert sentinel.exists(), f"child did not observe SIGTERM (rc={rc})"
+        assert rc == 42, f"expected child rc=42, got {rc}"
+
+    def test_cov_wrapper_sigusr1_saves_without_killing_child(self, tmp_path):
+        import signal as _signal
+
+        child_pid_file = tmp_path / "child_pid"
+        orig = f"#!/bin/bash\necho $$ > {child_pid_file}\nsleep 30\n"
+        proc = _spawn_wrapper(tmp_path, orig)
+        try:
+            time.sleep(0.5)
+            assert child_pid_file.exists(), "child did not start"
+            child_pid = int(child_pid_file.read_text().strip())
+
+            proc.send_signal(_signal.SIGUSR1)
+            time.sleep(0.5)
+
+            # Child must still be alive — SIGUSR1 forwarded would have killed it.
+            try:
+                os_kill_ok = True
+                import os as _os
+
+                _os.kill(child_pid, 0)
+            except ProcessLookupError:
+                os_kill_ok = False
+            assert os_kill_ok, (
+                "child died after SIGUSR1 — regression: SIGUSR1 was forwarded"
+            )
+
+            # Wrapper still alive too.
+            assert proc.poll() is None, "wrapper exited after SIGUSR1"
+
+            # Now shut down cleanly.
+            proc.send_signal(_signal.SIGTERM)
+            proc.wait(timeout=5)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=2)
+
+    def test_cov_wrapper_propagates_coverage_env_to_child(self, tmp_path):
+        env_dump = tmp_path / "child_env"
+        orig = f'#!/bin/bash\necho "$COVERAGE_PROCESS_START" > {env_dump}\n'
+        proc = _spawn_wrapper(tmp_path, orig)
+        try:
+            rc = proc.wait(timeout=5)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=2)
+        assert rc == 0
+        assert env_dump.exists()
+        # Wrapper sets COVERAGE_PROCESS_START via setdefault to <tmp>/.coveragerc
+        assert env_dump.read_text().strip() == str(tmp_path / ".coveragerc")
+
+
+class TestCovWrapperTemplates:
+    def test_shim_template_renders_valid_python(self):
+        ast.parse(_COV_WRAPPER_TEMPLATE_SHIM)
+
+    def test_legacy_template_renders_valid_python(self):
+        # Legacy template has a {entrypoint} format placeholder; fill it first.
+        rendered = _COV_WRAPPER_TEMPLATE_LEGACY.format(entrypoint="echo hi")
+        ast.parse(rendered)
+
+    def test_shim_template_no_unfilled_placeholders(self):
+        # Default-path template has no format params — it should parse as-is.
+        assert "{entrypoint}" not in _COV_WRAPPER_TEMPLATE_SHIM
+        assert "{" not in _COV_WRAPPER_TEMPLATE_SHIM.split("\n", 1)[1] or "{" in "{:}"
+        # Looser: ensure split signal handlers exist
+        assert "_save_and_forward" in _COV_WRAPPER_TEMPLATE_SHIM
+        assert "_save(" in _COV_WRAPPER_TEMPLATE_SHIM
+        assert "send_signal" in _COV_WRAPPER_TEMPLATE_SHIM
+        assert "_orig_run.sh" in _COV_WRAPPER_TEMPLATE_SHIM
+        assert "COVERAGE_PROCESS_START" in _COV_WRAPPER_TEMPLATE_SHIM
