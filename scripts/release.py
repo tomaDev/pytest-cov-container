@@ -1,15 +1,21 @@
 """Cut a release.
 
-Reads __version__ from src/pytest_cov_container/__about__.py, then:
-  1. Verifies clean working tree on main.
-  2. Verifies the tag does not already exist locally or on origin.
-  3. Pushes main.
-  4. Creates and pushes the tag.
+Usage:
+    hatch run release [VERSION]
+    python scripts/release.py [VERSION]
+
+If VERSION is given:
+    1. Bumps src/pytest_cov_container/__about__.py to VERSION via `hatch version`.
+    2. Commits the bump as "release VERSION".
+
+Then, regardless:
+    3. Verifies clean working tree on main.
+    4. Verifies the tag does not already exist locally or on origin.
+    5. Pushes main.
+    6. Creates and pushes the tag.
 
 Pushing the tag triggers .github/workflows/release.yaml, which builds and
 publishes to PyPI via OIDC trusted publisher.
-
-Run via: `hatch run release:cut` (or `python scripts/cut_release.py`).
 """
 
 from __future__ import annotations
@@ -35,9 +41,24 @@ def _read_version() -> str:
     return match.group(1)
 
 
-def main() -> int:
-    version = _read_version()
+def _bump_and_commit(new_version: str) -> None:
+    current = _read_version()
+    if new_version == current:
+        print(f"version already at {new_version}; skipping bump")
+        return
+    _run("hatch", "version", new_version)
+    _run("git", "add", str(ABOUT.relative_to(ROOT)))
+    _run("git", "commit", "-m", f"release {new_version}")
+    print(f"bumped {current} → {new_version}")
 
+
+def main() -> int:
+    if len(sys.argv) > 2:
+        print("usage: release.py [VERSION]", file=sys.stderr)
+        return 2
+
+    # Preflight BEFORE any mutation, so a dirty tree never produces a
+    # "release X.Y.Z" commit that then fails to push.
     branch = _run("git", "branch", "--show-current", capture=True)
     if branch != "main":
         print(f"error: must be on main (currently {branch!r})", file=sys.stderr)
@@ -47,6 +68,11 @@ def main() -> int:
     if status:
         print("error: working tree not clean:\n" + status, file=sys.stderr)
         return 1
+
+    if len(sys.argv) == 2:
+        _bump_and_commit(sys.argv[1])
+
+    version = _read_version()
 
     local_tag = _run("git", "tag", "--list", version, capture=True)
     if local_tag:

@@ -129,8 +129,10 @@ hatch run types:check
 # Security scan
 hatch run security:scan
 
-# Cut a release (bump __about__.py first, commit, then run)
-hatch run release:cut
+# Cut a release. Pass the new version to bump + tag + push in one shot;
+# omit it to release the current __about__.py version.
+hatch run release 0.3.0
+hatch run release
 ```
 
 ## License
