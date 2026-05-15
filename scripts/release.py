@@ -1,18 +1,27 @@
 """Cut a release.
 
 Usage:
-    hatch run release [VERSION]
-    python scripts/release.py [VERSION]
+    hatch run release [VERSION_OR_SEGMENT]
+    python scripts/release.py [VERSION_OR_SEGMENT]
 
-If VERSION is given:
-    1. Bumps src/pytest_cov_container/__about__.py to VERSION via `hatch version`.
-    2. Commits the bump as "release VERSION".
+Examples:
+    hatch run release           # use current __about__.py version
+    hatch run release patch     # 0.2.0 → 0.2.1
+    hatch run release minor     # 0.2.0 → 0.3.0
+    hatch run release major     # 0.2.0 → 1.0.0
+    hatch run release 0.3.5     # explicit version
 
-Then, regardless:
-    3. Verifies clean working tree on main.
-    4. Verifies the tag does not already exist locally or on origin.
-    5. Pushes main.
-    6. Creates and pushes the tag.
+If an argument is given, it is passed straight to `hatch version`, which
+accepts either a literal version or a segment keyword (`patch`, `minor`,
+`major`, `rc`, `b`, `a`, `post`, `dev`, etc.). The resolved version is
+then read back and used for the release commit + tag.
+
+Workflow:
+    1. Verify clean working tree on main (BEFORE any mutation).
+    2. If an argument is given: bump __about__.py, commit "release X.Y.Z".
+    3. Verify the resolved tag does not already exist locally or on origin.
+    4. Push main.
+    5. Create and push the tag.
 
 Pushing the tag triggers .github/workflows/release.yaml, which builds and
 publishes to PyPI via OIDC trusted publisher.
@@ -41,15 +50,18 @@ def _read_version() -> str:
     return match.group(1)
 
 
-def _bump_and_commit(new_version: str) -> None:
+def _bump_and_commit(spec: str) -> None:
+    """Pass `spec` to `hatch version` (literal X.Y.Z or segment like `patch`),
+    then read the resolved version back and commit if it changed."""
     current = _read_version()
-    if new_version == current:
-        print(f"version already at {new_version}; skipping bump")
+    _run("hatch", "version", spec)
+    new = _read_version()
+    if new == current:
+        print(f"version already at {current}; skipping bump")
         return
-    _run("hatch", "version", new_version)
     _run("git", "add", str(ABOUT.relative_to(ROOT)))
-    _run("git", "commit", "-m", f"release {new_version}")
-    print(f"bumped {current} → {new_version}")
+    _run("git", "commit", "-m", f"release {new}")
+    print(f"bumped {current} → {new}")
 
 
 def main() -> int:
