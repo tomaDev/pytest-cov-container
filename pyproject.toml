@@ -65,6 +65,12 @@ dependencies = ["ty"]
 [tool.hatch.envs.types.scripts]
 check = "ty check src/"
 
+[tool.hatch.envs.release]
+detached = true
+
+[tool.hatch.envs.release.scripts]
+cut = "python scripts/cut_release.py"
+
 [tool.bandit]
 exclude_dirs = ["tests"]
 skips = ["B108", "B404", "B603"]

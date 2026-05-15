@@ -128,6 +128,9 @@ hatch run types:check
 
 # Security scan
 hatch run security:scan
+
+# Cut a release (bump __about__.py first, commit, then run)
+hatch run release:cut
 ```
 
 ## License
