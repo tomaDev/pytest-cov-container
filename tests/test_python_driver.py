@@ -112,12 +112,14 @@ class TestPythonDriverCollect:
             status="exited",
         )
 
+    @pytest.mark.filterwarnings("ignore:No coverage data found")
     def test_signals_running_container(self, tmp_path):
         mock_backend = MagicMock()
         mock_backend.extract_matching_files.return_value = []
         self.driver.collect(mock_backend, self.container_running, tmp_path, self.config)
         mock_backend.send_signal.assert_called_once_with("abc123")
 
+    @pytest.mark.filterwarnings("ignore:No coverage data found")
     def test_skips_signal_for_stopped_container(self, tmp_path):
         mock_backend = MagicMock()
         mock_backend.extract_matching_files.return_value = []

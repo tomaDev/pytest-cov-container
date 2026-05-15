@@ -61,6 +61,7 @@ class TestContainerCovPluginSessionStart:
 
 
 class TestContainerCovPluginSessionFinish:
+    @pytest.mark.filterwarnings("ignore:coverage combine failed")
     @patch("pytest_cov_container.plugin.DockerBackend")
     @patch("subprocess.run")
     def test_warns_when_no_containers_found(
@@ -74,6 +75,7 @@ class TestContainerCovPluginSessionFinish:
         with pytest.warns(UserWarning, match="No matching containers"):
             plugin.pytest_sessionfinish(mock_session, exitstatus=0)
 
+    @pytest.mark.filterwarnings("ignore:No coverage data found")
     @patch("pytest_cov_container.plugin.DockerBackend")
     @patch("subprocess.run")
     def test_collects_and_combines(
@@ -101,6 +103,7 @@ class TestContainerCovPluginSessionFinish:
         cmd = call_args[0][0]
         assert cmd[1:4] == ["-m", "coverage", "combine"]
 
+    @pytest.mark.filterwarnings("ignore:No coverage data found")
     @patch("pytest_cov_container.plugin.DockerBackend")
     @patch("subprocess.run")
     def test_writes_paths_config(
