@@ -154,9 +154,10 @@ class TestEndToEndDefaultPath:
             "def main():\n    return 1 + 2\n\nif __name__ == '__main__':\n    main()\n"
         )
 
-        # User's run.sh exec's their app
+        # User's run.sh exec's their app. Quote paths — sys.executable may
+        # contain spaces (e.g. hatch venvs under "Application Support").
         run_sh = build / "run.sh"
-        run_sh.write_text(f"#!/bin/bash\nexec {sys.executable} {app}\n")
+        run_sh.write_text(f'#!/bin/bash\nexec "{sys.executable}" "{app}"\n')
         run_sh.chmod(0o755)
 
         # site-packages with a `.pth` calling coverage.process_startup() —
