@@ -25,6 +25,7 @@ class TestLoadConfig:
 
     def test_loads_driver_config(self, sample_pyproject):
         result = config.load_config(sample_pyproject)
+        assert result is not None
         assert result.driver_config is not None
         assert result.driver_config.build_dir == ".aws-sam/build/ApiFunction"
         assert (
@@ -37,15 +38,18 @@ class TestLoadConfig:
         pyproject = tmp_path / "pyproject.toml"
         pyproject.write_text('[tool.pytest-cov-container]\nimage_pattern = "myapp*"\n')
         result = config.load_config(pyproject)
+        assert result is not None
         assert result.language == "python"
         assert result.enabled is True
         assert result.path_mapping == {}
+        assert result.driver_config is not None
         assert result.driver_config.build_dir == ".aws-sam/build/ApiFunction"
 
     def test_disabled_config(self, tmp_path):
         pyproject = tmp_path / "pyproject.toml"
         pyproject.write_text("[tool.pytest-cov-container]\nenabled = false\n")
         result = config.load_config(pyproject)
+        assert result is not None
         assert result.enabled is False
 
     def test_load_config_entrypoint_omitted_yields_none(self, tmp_path):
@@ -57,6 +61,8 @@ class TestLoadConfig:
             'build_dir = ".aws-sam/build/ApiFunction"\n'
         )
         result = config.load_config(pyproject)
+        assert result is not None
+        assert result.driver_config is not None
         assert result.driver_config.entrypoint is None
 
     def test_load_config_entrypoint_empty_raises(self, tmp_path):
@@ -79,4 +85,6 @@ class TestLoadConfig:
             'entrypoint = "x y z"\n'
         )
         result = config.load_config(pyproject)
+        assert result is not None
+        assert result.driver_config is not None
         assert result.driver_config.entrypoint == "x y z"
