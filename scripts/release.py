@@ -18,10 +18,14 @@ then read back and used for the release commit + tag.
 
 Workflow:
     1. Verify clean working tree on main (BEFORE any mutation).
-    2. If an argument is given: bump __about__.py, commit "release X.Y.Z".
-    3. Verify the resolved tag does not already exist locally or on origin.
-    4. Push main.
-    5. Create and push the tag.
+    2. `git fetch origin main`, then `git pull --ff-only` so local main is
+       in sync with origin before any new commits or tags are created.
+       Refuses if origin/main has diverged (forces an explicit rebase /
+       merge decision rather than papering over it).
+    3. If an argument is given: bump __about__.py, commit "release X.Y.Z".
+    4. Verify the resolved tag does not already exist locally or on origin.
+    5. Push main.
+    6. Create and push the tag.
 
 Pushing the tag triggers .github/workflows/release.yaml, which builds and
 publishes to PyPI via OIDC trusted publisher.
@@ -80,6 +84,23 @@ def main() -> int:
     if status:
         print("error: working tree not clean:\n" + status, file=sys.stderr)
         return 1
+
+    # Sync with origin BEFORE bumping so a divergent remote does not produce
+    # a stranded "release X.Y.Z" commit that can never be pushed.
+    print("fetching origin/main")
+    _run("git", "fetch", "origin", "main")
+    behind = _run("git", "rev-list", "--count", "main..origin/main", capture=True)
+    ahead = _run("git", "rev-list", "--count", "origin/main..main", capture=True)
+    if int(behind) > 0 and int(ahead) > 0:
+        print(
+            f"error: main has diverged from origin/main "
+            f"({ahead} ahead, {behind} behind). Rebase or merge before releasing.",
+            file=sys.stderr,
+        )
+        return 1
+    if int(behind) > 0:
+        print(f"fast-forwarding {behind} commit(s) from origin/main")
+        _run("git", "merge", "--ff-only", "origin/main")
 
     if len(sys.argv) == 2:
         _bump_and_commit(sys.argv[1])
