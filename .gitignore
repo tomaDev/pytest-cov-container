@@ -1,1 +1,4 @@
 __pycache__/
+
+# /comprehensive-review:full-review session artifacts — local-only.
+.full-review/
