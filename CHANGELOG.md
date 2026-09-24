@@ -1,5 +1,93 @@
 # Changelog
 
+## 0.4.0 — 2026-09-24
+
+Makes the plugin usable with `sam local` under pytest-xdist and with several
+checkouts of one project running at once. Driven by a SAM project that had
+hand-rolled all of this in its test fixtures.
+
+### Fixed
+
+- **Plugin never activated**: `pytest_configure` registered the plugin
+  instance under `cov_container`, the name its own pytest11 entry-point
+  module already holds, so every real activation raised
+  `ValueError: Plugin name already registered` (INTERNALERROR). The instance
+  now registers as `cov_container_session`.
+- **Host coverage clobbered**: the end-of-session `coverage combine` ran
+  without `--append`, after pytest-cov had written its data, so it replaced
+  the host data with container data. Collected files now become suffix files
+  of pytest-cov's data file (`<data_file>.container-<worker>-<id>`) and
+  pytest-cov's own combine merges them, so its report and `--cov-fail-under`
+  include container coverage.
+- **Collection came too late for the report**: collection moved from
+  `pytest_sessionfinish` (after pytest-cov reported) to a `pytest_runtestloop`
+  wrapper that runs before pytest-cov's.
+- **Project coverage config ignored**: combine used a `[paths]`-only rcfile.
+  It now runs under the project's config (`[paths]`, `branch`, `omit`);
+  `path_mapping` still applies, now when each file is handed over.
+- **Branch/statement mismatch**: the injected `.coveragerc` now copies the
+  host's `branch` setting (overridable with `[python] branch`). Before, a
+  project with `branch = true` failed to combine with "Can't combine branch
+  coverage data with statement data".
+- **Self-signalling `/proc` scan**: the `sh -c` that scanned
+  `/proc/*/cmdline` for `_cov_wrapper` carried that token in its own command
+  line, could match itself, and SIGUSR1's default action killed it before it
+  reported. Signalling now uses a pid file (see "Save protocol").
+- **Truncated copies**: completion was detected by polling the data file's
+  mtime (2 s cap), which can fire mid-write. The coverage process now writes a
+  sentinel after `cov.save()` returns and the host waits for it (10 s cap).
+- **SQLite side files** (`-journal`, `-wal`, `-shm`) are no longer extracted
+  as data files. Files from different containers can no longer overwrite each
+  other in the staging directory.
+- **False "No data was collected" warning**: a process whose tests only drive
+  containers measures nothing itself, so coverage warned at save time even
+  though container data was about to be combined. Once a container yields
+  data, the plugin silences that warning for the process. A process that gets
+  nothing from its containers still warns.
+
+### Added
+
+- **Ownership keys** for tools that set no Docker labels (`sam local`):
+  `mount_prefix` (the container bind-mounts a directory under
+  `<rootdir>/<mount_prefix>/`; nested checkouts and prefix-sharing siblings do
+  not match) and `worker_env` (the container env carries
+  `<worker_env>=<xdist worker id>`).
+- **xdist support**: the controller injects before workers start; each worker
+  collects only its own containers; the controller does not collect.
+- `required = true` / `--cov-container-required`: a collection pass that gets
+  no data raises (explicit call) or fails the session (end-of-session pass).
+- `[python] wrapper = false`: the application starts coverage itself and runs
+  the save protocol; the plugin writes only `.coveragerc` and leaves `run.sh`
+  alone.
+- `[python] source_dir` (measure only this host directory's `*.py`, rendered
+  under `container_root`), `container_root` (default `/var/task`),
+  `relative_files` (default `true`), `branch`.
+- `image_pattern` accepts a list. Matching uses the container's
+  `Config.Image` first (no image lookup), then its tags.
+- Public API: `container_env(rootpath)`, `owned_containers(rootpath,
+  all_workers=False)`, `worker_id()`, `PID_FILE`, `DONE_FILE`.
+  `collect_container_coverage()` returns the number of files collected.
+
+### Changed
+
+- **Minimum dependency versions raised** to the latest releases, all of which
+  support Python 3.11: `pytest>=9.1.1`, `pytest-cov>=7.1.0`, `docker>=7.2.0`,
+  `coverage>=7.16.1`. The old floors were broken: the plugin needs pluggy's
+  new-style hook wrappers (pluggy 1.2+, which pytest 7.0 did not require) and
+  `CoverageData.close()` (coverage 7.10.3+).
+- **SAM defaults**: `label` defaults to `sam.cli.container.type=lambda`, which
+  SAM CLI 1.165+ sets on every Lambda container, and `mount_prefix` defaults
+  to the parent of `build_dir` (the SAM build root, so only this checkout's
+  containers match). A config with no selector used to match every container
+  on the host. `""` switches either filter off. The "no coverage collected"
+  error now names the label filter.
+- Injected files are written atomically (temp file + rename).
+- The docker client is created on first use, not at configure time.
+- `DockerBackend.file_signature` / `wait_for_save` are replaced by
+  `wait_for_done`. `LanguageDriver.inject` takes `rootpath` and `branch`
+  keywords, `collect` returns the extracted files, and drivers implement
+  `container_env(config)`.
+
 ## 0.3.0 — 2026-05-15
 
 Security + correctness + performance hardening pass driven by a multi-agent

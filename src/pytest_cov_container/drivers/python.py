@@ -1,11 +1,13 @@
 import json
 import logging
+import os
 import shutil
 import stat
 import sys
 import warnings
 from pathlib import Path
 
+from pytest_cov_container import protocol
 from pytest_cov_container.models import (
     ContainerInfo,
     DockerBackendProtocol,
@@ -15,17 +17,69 @@ from pytest_cov_container.models import (
 
 logger = logging.getLogger(__name__)
 
-_COVERAGERC_TEMPLATE = """\
-[run]
-data_file = /tmp/.coverage.container
-relative_files = true
-parallel = true
-sigterm = true
-include =
-    *.py
-omit =
-    _cov_wrapper.py
-"""
+# Directory names never measured when ``source_dir`` enumerates the include list:
+# test trees and caches are not deployed, and dot-dirs (``.venv``, ``.aws-sam``)
+# hold third-party or build copies.
+_SOURCE_SKIP_DIRS = frozenset({"__pycache__", "tests"})
+
+
+def _include_patterns(config: DriverConfig, rootpath: Path | None) -> list[str]:
+    """``include`` entries for the container rcfile.
+
+    With ``source_dir``: every ``*.py`` under it, rendered at its container path,
+    so vendored dependencies sharing the container root stay unmeasured.
+    Without: ``*.py`` (everything the container imports).
+    """
+    if config.source_dir is None:
+        return ["*.py"]
+    source = Path(config.source_dir)
+    if not source.is_absolute():
+        if rootpath is None:
+            raise ValueError("source_dir is relative but no rootpath was given")
+        source = rootpath / source
+    if not source.is_dir():
+        raise FileNotFoundError(f"source_dir {source} does not exist")
+    root = config.container_root.rstrip("/")
+    patterns = []
+    for path in sorted(source.rglob("*.py")):
+        rel = path.relative_to(source)
+        if any(part in _SOURCE_SKIP_DIRS or part.startswith(".") for part in rel.parts[:-1]):
+            continue
+        patterns.append(f"{root}/{rel.as_posix()}")
+    return patterns
+
+
+def render_coveragerc(config: DriverConfig, *, rootpath: Path | None = None, branch: bool = False) -> str:
+    """The ``.coveragerc`` the container-side coverage process reads.
+
+    ``branch`` must equal the host's setting (``DriverConfig.branch`` overrides
+    it); a statement-only container dataset cannot combine with branch data.
+    """
+    branch = branch if config.branch is None else config.branch
+    include = "\n    ".join(_include_patterns(config, rootpath))
+    return (
+        "[run]\n"
+        f"data_file = {protocol.DATA_DIR}/{protocol.DATA_PREFIX}\n"
+        f"relative_files = {str(config.relative_files).lower()}\n"
+        f"branch = {str(branch).lower()}\n"
+        "parallel = true\n"
+        "sigterm = true\n"
+        "include =\n"
+        f"    {include}\n"
+        "omit =\n"
+        "    */_cov_wrapper.py\n"
+    )
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` so a concurrent reader sees old or new, never partial.
+
+    A container started by a parallel session can read the rcfile while this
+    process rewrites it.
+    """
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(text)
+    tmp.replace(path)
 
 _COV_WRAPPER_TEMPLATE_SHIM = """\
 import os
@@ -47,6 +101,10 @@ os.environ.setdefault("COVERAGE_PROCESS_START", os.path.join(_HERE, ".coveragerc
 
 cov = coverage.Coverage(config_file=os.environ["COVERAGE_PROCESS_START"])
 cov.start()
+# Save protocol (pytest_cov_container.protocol): the host signals the pid in
+# this file, then waits for the sentinel written after each save.
+with open(__PID_FILE__, "w") as _pid_f:
+    _pid_f.write(str(os.getpid()))
 
 # `proc` must exist as a name before signal handlers are installed because
 # both handlers close over it. Pre-declare to None to make the closure safe
@@ -60,6 +118,9 @@ def _save(_signum, _frame):
     # Do NOT forward — default Linux disposition for SIGUSR1 is `terminate`
     # and the user app rarely installs a handler; forwarding would kill it.
     cov.save()
+    # Sentinel: the host copies data files only after this exists, so it
+    # never reads a half-written SQLite file.
+    open(__DONE_FILE__, "w").close()
 
 
 def _save_and_forward(signum, _frame):
@@ -109,12 +170,15 @@ cov = coverage.Coverage(
     config_file=os.environ.get("COVERAGE_PROCESS_START", os.path.join(_HERE, ".coveragerc"))
 )
 cov.start()
+with open(__PID_FILE__, "w") as _pid_f:
+    _pid_f.write(str(os.getpid()))
 
 proc: subprocess.Popen | None = None
 
 
 def _save(_signum, _frame):
     cov.save()
+    open(__DONE_FILE__, "w").close()
 
 
 def _save_and_forward(signum, _frame):
@@ -200,7 +264,30 @@ def _find_coverage_pth(build_dir: Path) -> Path | None:
     return None
 
 
-def _inject_shim(target_dir: Path, config: DriverConfig) -> InjectionResult:  # noqa: ARG001
+def _render_wrapper(
+    template: str,
+    *,
+    pid_file: str = protocol.PID_FILE,
+    done_file: str = protocol.DONE_FILE,
+) -> str:
+    """Fill the protocol paths into a wrapper template.
+
+    The paths are the protocol constants; tests pass host temp paths.
+    """
+    return template.replace("__PID_FILE__", repr(pid_file)).replace(
+        "__DONE_FILE__", repr(done_file)
+    )
+
+
+def _make_executable(path: Path) -> None:
+    path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def _coverage_env(config: DriverConfig) -> dict[str, str]:
+    return {"COVERAGE_PROCESS_START": f"{config.container_root.rstrip('/')}/.coveragerc"}
+
+
+def _inject_shim(target_dir: Path, config: DriverConfig, rcfile: str) -> InjectionResult:
     run_sh = target_dir / "run.sh"
     orig = target_dir / "_orig_run.sh"
 
@@ -244,27 +331,24 @@ def _inject_shim(target_dir: Path, config: DriverConfig) -> InjectionResult:  # 
     files: list[Path] = []
 
     coveragerc = target_dir / ".coveragerc"
-    coveragerc.write_text(_COVERAGERC_TEMPLATE)
+    _atomic_write(coveragerc, rcfile)
     files.append(coveragerc)
 
     wrapper = target_dir / "_cov_wrapper.py"
-    wrapper.write_text(_COV_WRAPPER_TEMPLATE_SHIM)
+    _atomic_write(wrapper, _render_wrapper(_COV_WRAPPER_TEMPLATE_SHIM))
     files.append(wrapper)
 
-    run_sh.write_text(_RUN_SH_TEMPLATE)
-    run_sh.chmod(run_sh.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    _atomic_write(run_sh, _RUN_SH_TEMPLATE)
+    _make_executable(run_sh)
     files.append(run_sh)
 
-    orig.chmod(orig.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    _make_executable(orig)
     files.append(orig)
 
-    return InjectionResult(
-        files_written=files,
-        env_vars={"COVERAGE_PROCESS_START": "/var/task/.coveragerc"},
-    )
+    return InjectionResult(files_written=files, env_vars=_coverage_env(config))
 
 
-def _inject_legacy(target_dir: Path, config: DriverConfig) -> InjectionResult:
+def _inject_legacy(target_dir: Path, config: DriverConfig, rcfile: str) -> InjectionResult:
     orig = target_dir / "_orig_run.sh"
     if orig.exists():
         logger.debug("override path: unlinking stale _orig_run.sh at %s", orig)
@@ -273,7 +357,7 @@ def _inject_legacy(target_dir: Path, config: DriverConfig) -> InjectionResult:
     files: list[Path] = []
 
     coveragerc = target_dir / ".coveragerc"
-    coveragerc.write_text(_COVERAGERC_TEMPLATE)
+    _atomic_write(coveragerc, rcfile)
     files.append(coveragerc)
 
     # Entrypoint is written to a sidecar JSON file and loaded by the wrapper
@@ -281,31 +365,49 @@ def _inject_legacy(target_dir: Path, config: DriverConfig) -> InjectionResult:
     # Prevents code-injection attacks via a hostile `entrypoint` value in
     # pyproject.toml (CWE-94 + CWE-78).
     entrypoint_json = target_dir / "_cov_entrypoint.json"
-    entrypoint_json.write_text(json.dumps({"entrypoint": config.entrypoint}))
+    _atomic_write(entrypoint_json, json.dumps({"entrypoint": config.entrypoint}))
     files.append(entrypoint_json)
 
     wrapper = target_dir / "_cov_wrapper.py"
-    wrapper.write_text(_COV_WRAPPER_TEMPLATE_LEGACY)
+    _atomic_write(wrapper, _render_wrapper(_COV_WRAPPER_TEMPLATE_LEGACY))
     files.append(wrapper)
 
     run_sh = target_dir / "run.sh"
-    run_sh.write_text(_RUN_SH_TEMPLATE)
-    run_sh.chmod(run_sh.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    _atomic_write(run_sh, _RUN_SH_TEMPLATE)
+    _make_executable(run_sh)
     files.append(run_sh)
 
-    return InjectionResult(
-        files_written=files,
-        env_vars={"COVERAGE_PROCESS_START": "/var/task/.coveragerc"},
-    )
+    return InjectionResult(files_written=files, env_vars=_coverage_env(config))
+
+
+def _inject_rcfile_only(target_dir: Path, config: DriverConfig, rcfile: str) -> InjectionResult:
+    """``wrapper = false``: the application starts coverage and runs the save protocol."""
+    coveragerc = target_dir / ".coveragerc"
+    _atomic_write(coveragerc, rcfile)
+    return InjectionResult(files_written=[coveragerc], env_vars=_coverage_env(config))
 
 
 class PythonDriver:
     name: str = "python"
 
-    def inject(self, target_dir: Path, config: DriverConfig) -> InjectionResult:
+    def container_env(self, config: DriverConfig) -> dict[str, str]:
+        """Env the container needs for coverage to start (see ``InjectionResult.env_vars``)."""
+        return _coverage_env(config)
+
+    def inject(
+        self,
+        target_dir: Path,
+        config: DriverConfig,
+        *,
+        rootpath: Path | None = None,
+        branch: bool = False,
+    ) -> InjectionResult:
+        rcfile = render_coveragerc(config, rootpath=rootpath, branch=branch)
+        if not config.wrapper:
+            return _inject_rcfile_only(target_dir, config, rcfile)
         if config.entrypoint is None:
-            return _inject_shim(target_dir, config)
-        return _inject_legacy(target_dir, config)
+            return _inject_shim(target_dir, config, rcfile)
+        return _inject_legacy(target_dir, config, rcfile)
 
     def collect(
         self,
@@ -313,40 +415,22 @@ class PythonDriver:
         container: ContainerInfo,
         dest: Path,
         config: DriverConfig,  # noqa: ARG002
-    ) -> Path:
-        if container.status == "running":
-            # Capture pre-signal file signature, send SIGUSR1, then poll for
-            # the wrapper's cov.save() to land (replaces the legacy fixed
-            # 1-second sleep that both wasted ~1s on fast hosts and raced
-            # on slow ones). Skip the poll if send_signal reports zero
-            # wrappers found — nothing to wait for, and a remote daemon
-            # spins ~2 s × N containers of pointless RTTs otherwise.
-            baseline = docker_backend.file_signature(
-                container.id,
-                "/tmp",  # noqa: S108
-                ".coverage.container",
-            )
-            signalled = docker_backend.send_signal(container.id)
-            if signalled > 0:
-                docker_backend.wait_for_save(
-                    container.id,
-                    "/tmp",  # noqa: S108
-                    ".coverage.container",
-                    baseline,
+    ) -> list[Path]:
+        """Save (running containers only), then copy the data files to ``dest``.
+
+        A stopped container is read as-is: its process saved on exit, if at all.
+        A running container without a coverage process (no pid file) is not an
+        error here; the caller decides whether an empty result is.
+        """
+        if container.status == "running" and docker_backend.send_signal(container.id) > 0:
+            if not docker_backend.wait_for_done(container.id):
+                warnings.warn(
+                    f"Container {container.name} ({container.id[:12]}): save "
+                    f"sentinel {protocol.DONE_FILE} not written in time; the "
+                    "copied data may be incomplete.",
+                    UserWarning,
+                    stacklevel=2,
                 )
-
-        extracted = docker_backend.extract_matching_files(
-            container.id,
-            "/tmp",  # noqa: S108
-            ".coverage.container",
-            dest,
+        return docker_backend.extract_matching_files(
+            container.id, protocol.DATA_DIR, protocol.DATA_PREFIX, dest
         )
-
-        if not extracted:
-            warnings.warn(
-                f"No coverage data found in container {container.name} ({container.id[:12]})",
-                UserWarning,
-                stacklevel=2,
-            )
-
-        return dest

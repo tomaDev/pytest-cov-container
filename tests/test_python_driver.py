@@ -11,6 +11,8 @@ from pytest_cov_container.drivers.python import (
     _COV_WRAPPER_TEMPLATE_LEGACY,
     _COV_WRAPPER_TEMPLATE_SHIM,
     PythonDriver,
+    _render_wrapper,
+    render_coveragerc,
 )
 from pytest_cov_container.models import ContainerInfo, DriverConfig, InjectionResult
 
@@ -72,7 +74,12 @@ class TestPythonDriverInject:
         assert "parallel = true" in content
         assert "sigterm = true" in content
         assert "data_file = /tmp/.coverage.container" in content
-        assert "_cov_wrapper.py" in content  # in omit section
+        assert "branch = false" in content
+        assert "*/_cov_wrapper.py" in content  # in omit section
+
+    def test_writes_are_atomic_leaving_no_temp_files(self, tmp_path):
+        self.driver.inject(tmp_path, self.config)
+        assert not list(tmp_path.glob("*.tmp"))
 
     def test_creates_cov_wrapper(self, tmp_path):
         self.driver.inject(tmp_path, self.config)
@@ -152,11 +159,7 @@ class TestPythonDriverInject:
 class TestPythonDriverCollect:
     def setup_method(self):
         self.driver = PythonDriver()
-        self.config = DriverConfig(
-            build_dir=".aws-sam/build/ApiFunction",
-            entrypoint="uvicorn app:app --host 0.0.0.0 --port 8080",
-            path_mapping={"src/api": "/var/task"},
-        )
+        self.config = DriverConfig(build_dir=".aws-sam/build/ApiFunction")
         self.container_running = ContainerInfo(
             id="abc123",
             name="sam-api",
@@ -172,88 +175,110 @@ class TestPythonDriverCollect:
             status="exited",
         )
 
-    @pytest.mark.filterwarnings("ignore:No coverage data found")
-    def test_signals_running_container(self, tmp_path):
-        mock_backend = MagicMock()
-        mock_backend.extract_matching_files.return_value = []
-        mock_backend.file_signature.return_value = ""
-        mock_backend.send_signal.return_value = 1
-        self.driver.collect(mock_backend, self.container_running, tmp_path, self.config)
-        mock_backend.send_signal.assert_called_once_with("abc123")
+    def _backend(self, *, signalled=1, done=True, files=()):
+        backend = MagicMock()
+        backend.send_signal.return_value = signalled
+        backend.wait_for_done.return_value = done
+        backend.extract_matching_files.return_value = list(files)
+        return backend
 
-    @pytest.mark.filterwarnings("ignore:No coverage data found")
-    def test_polls_for_save_completion_on_running(self, tmp_path):
-        mock_backend = MagicMock()
-        mock_backend.extract_matching_files.return_value = []
-        mock_backend.file_signature.return_value = "1700000000.0"
-        mock_backend.send_signal.return_value = 1  # one wrapper signalled
-        self.driver.collect(mock_backend, self.container_running, tmp_path, self.config)
-        # Baseline captured before signal, then wait_for_save called with it.
-        mock_backend.file_signature.assert_called_once_with(
-            "abc123", "/tmp", ".coverage.container"
-        )
-        mock_backend.wait_for_save.assert_called_once_with(
-            "abc123", "/tmp", ".coverage.container", "1700000000.0"
+    def test_running_container_signal_then_wait_then_extract(self, tmp_path):
+        backend = self._backend()
+        self.driver.collect(backend, self.container_running, tmp_path, self.config)
+        backend.send_signal.assert_called_once_with("abc123")
+        backend.wait_for_done.assert_called_once_with("abc123")
+        backend.extract_matching_files.assert_called_once_with(
+            "abc123", "/tmp", ".coverage.container", tmp_path
         )
 
-    @pytest.mark.filterwarnings("ignore:No coverage data found")
-    def test_skips_poll_when_no_wrapper_signalled(self, tmp_path):
-        # send_signal=0 means no wrapper in the container; no save will
-        # land, so polling would burn the full 2s timeout fruitlessly.
-        mock_backend = MagicMock()
-        mock_backend.extract_matching_files.return_value = []
-        mock_backend.file_signature.return_value = ""
-        mock_backend.send_signal.return_value = 0
-        self.driver.collect(mock_backend, self.container_running, tmp_path, self.config)
-        mock_backend.send_signal.assert_called_once_with("abc123")
-        mock_backend.wait_for_save.assert_not_called()
+    def test_skips_wait_when_no_coverage_process(self, tmp_path):
+        # signalled=0: no pid file, so no save will land; waiting would burn
+        # the whole timeout.
+        backend = self._backend(signalled=0)
+        self.driver.collect(backend, self.container_running, tmp_path, self.config)
+        backend.wait_for_done.assert_not_called()
+
+    def test_warns_when_sentinel_times_out(self, tmp_path):
+        backend = self._backend(done=False)
+        with pytest.warns(UserWarning, match="sentinel"):
+            self.driver.collect(backend, self.container_running, tmp_path, self.config)
+
+    def test_stopped_container_is_read_without_signal(self, tmp_path):
+        backend = self._backend()
+        self.driver.collect(backend, self.container_stopped, tmp_path, self.config)
+        backend.send_signal.assert_not_called()
+        backend.wait_for_done.assert_not_called()
+
+    def test_returns_extracted_files(self, tmp_path):
+        cov_file = tmp_path / ".coverage.container.host.1.abc"
+        backend = self._backend(files=[cov_file])
+        result = self.driver.collect(
+            backend, self.container_stopped, tmp_path, self.config
+        )
+        assert result == [cov_file]
 
     def test_collect_does_not_sleep(self):
-        # Regression: collect() previously did time.sleep(1) regardless of
-        # save state. Now should poll for save completion via backend.
         import inspect
 
         src = inspect.getsource(PythonDriver.collect)
         assert "time.sleep" not in src
 
-    @pytest.mark.filterwarnings("ignore:No coverage data found")
-    def test_skips_poll_for_stopped_container(self, tmp_path):
-        mock_backend = MagicMock()
-        mock_backend.extract_matching_files.return_value = []
-        self.driver.collect(mock_backend, self.container_stopped, tmp_path, self.config)
-        mock_backend.file_signature.assert_not_called()
-        mock_backend.wait_for_save.assert_not_called()
 
-    @pytest.mark.filterwarnings("ignore:No coverage data found")
-    def test_skips_signal_for_stopped_container(self, tmp_path):
-        mock_backend = MagicMock()
-        mock_backend.extract_matching_files.return_value = []
-        self.driver.collect(mock_backend, self.container_stopped, tmp_path, self.config)
-        mock_backend.send_signal.assert_not_called()
+class TestRenderCoveragerc:
+    def test_branch_inherits_host_setting(self):
+        rc = render_coveragerc(DriverConfig(build_dir="b"), branch=True)
+        assert "branch = true" in rc
 
-    def test_extracts_coverage_files(self, tmp_path):
-        mock_backend = MagicMock()
-        cov_file = tmp_path / ".coverage.container.host.1.abc"
-        cov_file.write_bytes(b"data")
-        mock_backend.extract_matching_files.return_value = [cov_file]
+    def test_branch_config_overrides_host(self):
+        rc = render_coveragerc(DriverConfig(build_dir="b", branch=False), branch=True)
+        assert "branch = false" in rc
 
-        result = self.driver.collect(
-            mock_backend, self.container_stopped, tmp_path, self.config
-        )
+    def test_relative_files_configurable(self):
+        rc = render_coveragerc(DriverConfig(build_dir="b", relative_files=False))
+        assert "relative_files = false" in rc
 
-        mock_backend.extract_matching_files.assert_called_once_with(
-            "def456", "/tmp", ".coverage.container", tmp_path
-        )
-        assert result == tmp_path
+    def test_default_include_measures_every_py(self):
+        rc = render_coveragerc(DriverConfig(build_dir="b"))
+        assert "include =\n    *.py\n" in rc
 
-    def test_warns_when_no_coverage_data(self, tmp_path):
-        mock_backend = MagicMock()
-        mock_backend.extract_matching_files.return_value = []
+    def test_source_dir_lists_only_our_files_at_container_paths(self, tmp_path):
+        src = tmp_path / "src" / "api"
+        for rel in (
+            "app.py",
+            "routers/admin.py",
+            "tests/test_app.py",
+            "__pycache__/app.cpython-314.py",
+            ".venv/lib/dep.py",
+        ):
+            (src / rel).parent.mkdir(parents=True, exist_ok=True)
+            (src / rel).write_text("")
+        cfg = DriverConfig(build_dir="b", source_dir="src/api", container_root="/var/task/")
+        rc = render_coveragerc(cfg, rootpath=tmp_path)
+        include = rc.split("include =\n", 1)[1].split("omit =", 1)[0].split()
+        assert include == ["/var/task/app.py", "/var/task/routers/admin.py"]
 
-        with pytest.warns(UserWarning, match="No coverage data found"):
-            self.driver.collect(
-                mock_backend, self.container_stopped, tmp_path, self.config
-            )
+    def test_missing_source_dir_raises(self, tmp_path):
+        cfg = DriverConfig(build_dir="b", source_dir="nope")
+        with pytest.raises(FileNotFoundError, match="source_dir"):
+            render_coveragerc(cfg, rootpath=tmp_path)
+
+
+class TestInjectWithoutWrapper:
+    def test_writes_only_the_rcfile_and_keeps_run_sh(self, tmp_path):
+        run_sh = tmp_path / "run.sh"
+        run_sh.write_text("#!/bin/bash\nexec python app.py\n")
+        cfg = DriverConfig(build_dir="b", wrapper=False, container_root="/app")
+        result = PythonDriver().inject(tmp_path, cfg)
+        assert result.files_written == [tmp_path / ".coveragerc"]
+        assert run_sh.read_text() == "#!/bin/bash\nexec python app.py\n"
+        assert not (tmp_path / "_cov_wrapper.py").exists()
+        assert result.env_vars == {"COVERAGE_PROCESS_START": "/app/.coveragerc"}
+
+    def test_needs_no_coverage_pth(self, tmp_path):
+        # The application imports coverage itself; no subprocess .pth needed.
+        cfg = DriverConfig(build_dir="b", wrapper=False)
+        PythonDriver().inject(tmp_path, cfg)
+        assert (tmp_path / ".coveragerc").exists()
 
 
 class TestPythonDriverInjectShim:
@@ -414,7 +439,13 @@ def _spawn_wrapper(
     (tmp_path / "_orig_run.sh").chmod(0o755)
 
     wrapper_path = tmp_path / "_cov_wrapper.py"
-    wrapper_path.write_text(_COV_WRAPPER_TEMPLATE_SHIM)
+    wrapper_path.write_text(
+        _render_wrapper(
+            _COV_WRAPPER_TEMPLATE_SHIM,
+            pid_file=str(tmp_path / "wrapper.pid"),
+            done_file=str(tmp_path / "save.done"),
+        )
+    )
 
     return subprocess.Popen(  # noqa: S603
         [sys.executable, str(wrapper_path)],
@@ -475,6 +506,10 @@ class TestCovWrapperSubprocessBehavior:
 
             # Wrapper still alive too.
             assert proc.poll() is None, "wrapper exited after SIGUSR1"
+            # Save protocol: pid file names the wrapper; sentinel follows the save.
+            assert (tmp_path / "wrapper.pid").read_text() == str(proc.pid)
+            assert (tmp_path / "save.done").exists()
+            assert list(tmp_path.glob(".coverage.container*"))
 
             # Now shut down cleanly.
             proc.send_signal(_signal.SIGTERM)

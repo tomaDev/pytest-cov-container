@@ -4,7 +4,9 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import coverage
 import pytest
+from coverage.data import CoverageData
 
 from pytest_cov_container.config import PluginConfig
 from pytest_cov_container.drivers.python import PythonDriver
@@ -16,227 +18,318 @@ from pytest_cov_container.plugin import ContainerCovPlugin
 def plugin_config():
     return PluginConfig(
         image_pattern="samcli/lambda*",
-        label="pytest-cov-container",
         language="python",
         enabled=True,
-        path_mapping={"src/api": "/var/task"},
-        driver_config=DriverConfig(
-            build_dir=".aws-sam/build/ApiFunction",
-            entrypoint="uvicorn app:app --host 0.0.0.0 --port 8080",
-            path_mapping={"src/api": "/var/task"},
-        ),
+        driver_config=DriverConfig(build_dir=".aws-sam/build/ApiFunction"),
     )
 
 
-class TestContainerCovPluginSessionStart:
-    @patch("pytest_cov_container.plugin.DockerBackend")
-    def test_injects_when_build_dir_exists(
-        self, mock_backend_cls, plugin_config, tmp_path
-    ):  # noqa: ARG002
+@pytest.fixture
+def make_plugin(plugin_config, tmp_path, monkeypatch):
+    """A plugin with a mocked docker backend; pytest-cov's data file is
+    ``tmp_path/.coverage`` (the outer run's own Coverage is hidden)."""
+    monkeypatch.setattr(coverage.Coverage, "current", classmethod(lambda cls: None))
+    monkeypatch.setenv("COVERAGE_FILE", str(tmp_path / ".coverage"))
+    monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
+
+    def make(**kwargs):
+        with patch("pytest_cov_container.plugin.DockerBackend"):
+            return ContainerCovPlugin(plugin_config, tmp_path, **kwargs)
+
+    return make
+
+
+def _container(cid="c0", status="running"):
+    return ContainerInfo(id=cid, name=f"sam-{cid}", image="samcli/lambda:3.12", labels={}, status=status)
+
+
+def _data_file(path: Path, lines: dict[str, list[int]]) -> Path:
+    data = CoverageData(basename=str(path))
+    data.add_lines(lines)
+    data.close()
+    return path
+
+
+def _stub_collect(plugin, files_by_id: dict[str, list[Path]]):
+    plugin.driver = MagicMock()
+    plugin.driver.collect.side_effect = lambda backend, container, dest, cfg: files_by_id.get(container.id, [])
+
+
+class TestSessionStart:
+    def test_injects_when_build_dir_exists(self, make_plugin, plugin_config, tmp_path):
         build_dir = tmp_path / ".aws-sam" / "build" / "ApiFunction"
         build_dir.mkdir(parents=True)
-        plugin_config.driver_config.build_dir = str(build_dir)
-
-        plugin = ContainerCovPlugin(plugin_config)
-        mock_session = MagicMock()
-        mock_session.config.rootpath = tmp_path
-
-        plugin.pytest_sessionstart(mock_session)
-
+        plugin_config.driver_config.wrapper = False
+        plugin = make_plugin()
+        session = MagicMock()
+        session.config.rootpath = tmp_path
+        plugin.pytest_sessionstart(session)
         assert plugin.injection_result is not None
         assert (build_dir / ".coveragerc").exists()
-        assert (build_dir / "_cov_wrapper.py").exists()
-        assert (build_dir / "run.sh").exists()
 
-    @patch("pytest_cov_container.plugin.DockerBackend")
-    def test_raises_when_build_dir_missing(
-        self, mock_backend_cls, plugin_config, tmp_path
-    ):  # noqa: ARG002
-        plugin = ContainerCovPlugin(plugin_config)
-        mock_session = MagicMock()
-        mock_session.config.rootpath = tmp_path
-
+    def test_raises_when_build_dir_missing(self, make_plugin, tmp_path):
+        plugin = make_plugin()
+        session = MagicMock()
+        session.config.rootpath = tmp_path
         with pytest.raises(FileNotFoundError, match="does not exist"):
-            plugin.pytest_sessionstart(mock_session)
+            plugin.pytest_sessionstart(session)
+
+    def test_xdist_worker_does_not_inject(self, make_plugin, tmp_path):
+        # The controller injected before spawning workers; a worker rewriting
+        # the files could race a sibling's starting container.
+        plugin = make_plugin(is_worker=True)
+        session = MagicMock()
+        session.config.rootpath = tmp_path
+        plugin.pytest_sessionstart(session)  # build dir missing, yet no raise
+        assert plugin.injection_result is None
 
 
-class TestContainerCovPluginSessionFinish:
-    @patch("pytest_cov_container.plugin.DockerBackend")
-    @patch("subprocess.run")
-    def test_warns_when_no_containers_found(
-        self, mock_subprocess, mock_backend_cls, plugin_config
-    ):  # noqa: ARG002
-        mock_subprocess.return_value = MagicMock(returncode=0, stderr="", stdout="")
-        plugin = ContainerCovPlugin(plugin_config)
-        plugin.backend.find_containers.return_value = []
+class TestShardHandoff:
+    def test_shard_is_a_suffix_file_of_pytest_covs_data_file(self, make_plugin, tmp_path):
+        plugin = make_plugin()
+        src = _data_file(tmp_path / "extracted", {"/var/task/app.py": [1, 2]})
+        plugin._write_shard(src)
+        shards = list(tmp_path.glob(".coverage.container-main-*"))
+        assert len(shards) == 1
+        assert not src.exists()
+        data = CoverageData(basename=str(shards[0]))
+        data.read()
+        assert data.measured_files() == {"/var/task/app.py"}
+        assert not list(tmp_path.glob("*.tmp"))
 
-        mock_session = MagicMock()
-        mock_session.config.rootpath = Path("/project")
+    def test_shard_names_carry_the_worker_id(self, make_plugin, tmp_path, monkeypatch):
+        monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw2")
+        plugin = make_plugin()
+        plugin._write_shard(_data_file(tmp_path / "x", {"/var/task/a.py": [1]}))
+        assert list(tmp_path.glob(".coverage.container-gw2-*"))
+
+    def test_path_mapping_remaps_container_paths(self, make_plugin, plugin_config, tmp_path):
+        host_file = tmp_path / "src" / "api" / "app.py"
+        host_file.parent.mkdir(parents=True)
+        host_file.write_text("x = 1\n")
+        plugin_config.path_mapping = {"src/api": "/var/task"}
+        plugin = make_plugin()
+        plugin._write_shard(_data_file(tmp_path / "x", {"/var/task/app.py": [1]}))
+        (shard,) = tmp_path.glob(".coverage.container-*")
+        data = CoverageData(basename=str(shard))
+        data.read()
+        assert data.measured_files() == {str(host_file)}
+
+    def test_combines_with_host_data_via_coverage_combine(self, make_plugin, tmp_path):
+        # What pytest-cov's finish does: combine() picks up <data_file>.* files.
+        plugin = make_plugin()
+        _data_file(tmp_path / ".coverage.host.1.abc", {"/host/mod.py": [1]})
+        plugin._write_shard(_data_file(tmp_path / "x", {"/var/task/app.py": [3]}))
+        cov = coverage.Coverage(data_file=str(tmp_path / ".coverage"))
+        cov.combine()
+        assert cov.get_data().measured_files() == {"/host/mod.py", "/var/task/app.py"}
+
+
+class TestExplicitCollect:
+    def test_collects_running_owned_containers_only(self, make_plugin, tmp_path):
+        plugin = make_plugin()
+        plugin.find_owned = lambda **_: [_container("run"), _container("gone", status="exited")]
+        _stub_collect(plugin, {"run": [_data_file(tmp_path / "f1", {"/var/task/a.py": [1]})]})
+        assert plugin.collect_from_running() == 1
+        assert [c.args[1].id for c in plugin.driver.collect.call_args_list] == ["run"]
+        assert plugin.collected_ids == {"run"}
+
+    def test_required_raises_when_nothing_collected(self, make_plugin, plugin_config, monkeypatch):
+        monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw1")
+        plugin_config.worker_env = "MARK"
+        plugin = make_plugin(required=True)
+        plugin.find_owned = lambda **_: []
+        _stub_collect(plugin, {})
+        with pytest.raises(RuntimeError, match="MARK=gw1"):
+            plugin.collect_from_running()
+
+    def test_required_error_names_the_label_filter(self, make_plugin, plugin_config):
+        plugin_config.label = "sam.cli.container.type=lambda"
+        plugin = make_plugin(required=True)
+        plugin.find_owned = lambda **_: []
+        with pytest.raises(RuntimeError, match="labelled sam.cli.container.type=lambda"):
+            plugin.collect_from_running()
+
+    def test_not_required_returns_zero(self, make_plugin):
+        plugin = make_plugin()
+        plugin.find_owned = lambda **_: []
+        assert plugin.collect_from_running() == 0
+
+    def test_one_container_failure_does_not_block_the_rest(self, make_plugin, tmp_path):
+        plugin = make_plugin()
+        plugin.find_owned = lambda **_: [_container("a"), _container("b")]
+        good = _data_file(tmp_path / "good", {"/var/task/a.py": [1]})
+        plugin.driver = MagicMock()
+
+        def collect(backend, container, dest, cfg):
+            if container.id == "a":
+                raise RuntimeError("docker hiccup")
+            return [good]
+
+        plugin.driver.collect.side_effect = collect
+        with pytest.warns(UserWarning, match="collect failed for container sam-a"):
+            assert plugin.collect_from_running() == 1
+
+
+class TestCollectAtEnd:
+    def _session(self):
+        session = MagicMock()
+        session.testsfailed = 0
+        return session
+
+    def test_skips_containers_already_collected(self, make_plugin):
+        plugin = make_plugin()
+        plugin.collected_ids = {"a"}
+        plugin.explicit_calls = 1
+        plugin.find_owned = lambda **_: [_container("a", status="exited")]
+        _stub_collect(plugin, {})
+        plugin._collect_at_end(self._session())
+        plugin.driver.collect.assert_not_called()
+
+    def test_warns_when_nothing_found_and_no_explicit_call(self, make_plugin):
+        plugin = make_plugin()
+        plugin.find_owned = lambda **_: []
         with pytest.warns(UserWarning, match="No matching containers"):
-            plugin.pytest_sessionfinish(mock_session, exitstatus=0)
+            plugin._collect_at_end(self._session())
 
-    @pytest.mark.filterwarnings("ignore:No coverage data found")
-    @patch("pytest_cov_container.plugin.DockerBackend")
-    @patch("subprocess.run")
-    def test_collects_and_combines(
-        self, mock_subprocess, mock_backend_cls, plugin_config
-    ):  # noqa: ARG002
-        # subprocess.run returns rc=0 by default for success path.
-        mock_subprocess.return_value = MagicMock(returncode=0, stderr="", stdout="")
-        plugin = ContainerCovPlugin(plugin_config)
-        container = ContainerInfo(
-            id="abc123",
-            name="test",
-            image="samcli/lambda:3.12",
-            labels={},
-            status="exited",
+    def test_silent_after_an_explicit_call(self, make_plugin, recwarn):
+        plugin = make_plugin()
+        plugin.explicit_calls = 1
+        plugin.find_owned = lambda **_: []
+        plugin._collect_at_end(self._session())
+        assert not [w for w in recwarn.list if "No matching" in str(w.message)]
+
+    def test_required_fails_the_session_when_containers_yield_nothing(self, make_plugin):
+        plugin = make_plugin(required=True)
+        plugin.find_owned = lambda **_: [_container("a", status="exited")]
+        _stub_collect(plugin, {})
+        session = self._session()
+        plugin._collect_at_end(session)
+        assert session.testsfailed == 1
+        assert "yielded no coverage data" in plugin.failure
+
+    def test_required_raises_in_an_xdist_worker(self, make_plugin):
+        # A worker's testsfailed never reaches the controller's exit code.
+        plugin = make_plugin(required=True, is_worker=True)
+        plugin.find_owned = lambda **_: [_container("a", status="exited")]
+        _stub_collect(plugin, {})
+        with pytest.raises(RuntimeError, match="yielded no coverage data"):
+            plugin._collect_at_end(self._session())
+
+
+class TestContainerEnv:
+    def test_bootstrap_plus_worker_marker(self, make_plugin, plugin_config, monkeypatch):
+        monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw0")
+        plugin_config.worker_env = "MARK"
+        plugin = make_plugin()
+        assert plugin.container_env() == {
+            "COVERAGE_PROCESS_START": "/var/task/.coveragerc",
+            "MARK": "gw0",
+        }
+
+
+class TestPytestSession:
+    """Real pytest + pytest-cov sessions with a fake docker backend."""
+
+    CONFTEST = """
+import pytest_cov_container.plugin as plugin_module
+from coverage.data import CoverageData
+from pytest_cov_container.models import ContainerInfo
+
+EXTRACT = {extract!r}
+STATUS = {status!r}
+
+
+class FakeBackend:
+    def find_containers(self, image_pattern=None, label=None, predicate=None):
+        return [ContainerInfo(id="c1", name="fake", image="x", labels={{}}, status=STATUS)]
+
+    def send_signal(self, container_id):
+        return 0
+
+    def extract_matching_files(self, container_id, source_dir, prefix, dest):
+        if not EXTRACT:
+            return []
+        path = dest / "c1-.coverage.container.h.1.a"
+        data = CoverageData(basename=str(path))
+        data.add_lines({{EXTRACT: [1, 2]}})
+        data.close()
+        return [path]
+
+
+plugin_module.DockerBackend = FakeBackend
+"""
+
+    def _project(self, pytester, *, extract: bool, host_import: bool = True, explicit: bool = False):
+        pytester.makefile(
+            ".toml",
+            pyproject="""
+[tool.pytest-cov-container]
+image_pattern = "x*"
+
+[tool.pytest-cov-container.python]
+build_dir = "build"
+wrapper = false
+""",
         )
-        plugin.backend.find_containers.return_value = [container]
-        plugin.backend.extract_matching_files.return_value = []
-
-        mock_session = MagicMock()
-        mock_session.config.rootpath = Path("/project")
-
-        plugin.pytest_sessionfinish(mock_session, exitstatus=0)
-
-        mock_subprocess.assert_called_once()
-        call_args = mock_subprocess.call_args
-        cmd = call_args[0][0]
-        assert cmd[1:4] == ["-m", "coverage", "combine"]
-
-    @pytest.mark.filterwarnings("ignore:No coverage data found")
-    @patch("pytest_cov_container.plugin.DockerBackend")
-    @patch("subprocess.run")
-    def test_collects_multiple_containers_in_parallel(
-        self, mock_subprocess, mock_backend_cls, plugin_config
-    ):  # noqa: ARG002
-        # Regression: pre-0.3.0 the collect loop was sequential, which on a
-        # remote docker daemon meant 1s+ wall time per container. Now uses
-        # a ThreadPoolExecutor. Assert all containers' driver.collect is
-        # invoked.
-        from unittest.mock import patch as mock_patch
-
-        mock_subprocess.return_value = MagicMock(returncode=0, stderr="", stdout="")
-        plugin = ContainerCovPlugin(plugin_config)
-        containers = [
-            ContainerInfo(
-                id=f"c{i}",
-                name=f"sam-{i}",
-                image="samcli/lambda:3.12",
-                labels={},
-                status="exited",
+        (pytester.path / "build").mkdir()
+        src = pytester.path / "src"
+        src.mkdir()
+        (src / "container_app.py").write_text("def f():\n    return 1\n")
+        (src / "host_mod.py").write_text("X = 1\n")
+        target = str(src / "container_app.py") if extract else ""
+        status = "running" if explicit else "exited"
+        pytester.makeconftest(self.CONFTEST.format(extract=target, status=status))
+        if explicit:
+            # Collected in a fixture teardown, as a sam-local fixture does: inside
+            # pytest's per-test catch_warnings, which undoes any filter set there.
+            pytester.makepyfile(
+                test_x="import pytest\nimport pytest_cov_container\n\n"
+                "@pytest.fixture\ndef app():\n    yield\n"
+                "    assert pytest_cov_container.collect_container_coverage() == 1\n\n"
+                "def test_x(app):\n    pass\n"
             )
-            for i in range(5)
-        ]
-        plugin.backend.find_containers.return_value = containers
-        plugin.backend.extract_matching_files.return_value = []
-
-        mock_session = MagicMock()
-        mock_session.config.rootpath = Path("/project")
-
-        with mock_patch.object(plugin.driver, "collect") as mock_collect:
-            plugin.pytest_sessionfinish(mock_session, exitstatus=0)
-            assert mock_collect.call_count == 5
-            called_ids = {call.args[1].id for call in mock_collect.call_args_list}
-            assert called_ids == {"c0", "c1", "c2", "c3", "c4"}
-
-    @pytest.mark.filterwarnings("ignore:No coverage data found")
-    @patch("pytest_cov_container.plugin.DockerBackend")
-    @patch("subprocess.run")
-    def test_collect_failure_warns_and_continues(
-        self, mock_subprocess, mock_backend_cls, plugin_config
-    ):  # noqa: ARG002
-        # If one container's collect raises, the others must still run.
-        from unittest.mock import patch as mock_patch
-
-        mock_subprocess.return_value = MagicMock(returncode=0, stderr="", stdout="")
-        plugin = ContainerCovPlugin(plugin_config)
-        containers = [
-            ContainerInfo(
-                id=f"c{i}",
-                name=f"sam-{i}",
-                image="samcli/lambda:3.12",
-                labels={},
-                status="exited",
-            )
-            for i in range(3)
-        ]
-        plugin.backend.find_containers.return_value = containers
-        plugin.backend.extract_matching_files.return_value = []
-
-        mock_session = MagicMock()
-        mock_session.config.rootpath = Path("/project")
-
-        def collect_side_effect(backend, container, dest, config):  # noqa: ARG001
-            if container.id == "c1":
-                raise RuntimeError("simulated docker hiccup")
-            return dest
-
-        with (
-            mock_patch.object(
-                plugin.driver, "collect", side_effect=collect_side_effect
-            ),
-            pytest.warns(UserWarning, match="collect failed for container"),
-        ):
-            plugin.pytest_sessionfinish(mock_session, exitstatus=0)
-
-    @pytest.mark.filterwarnings("ignore:No coverage data found")
-    @patch("pytest_cov_container.plugin.DockerBackend")
-    @patch("subprocess.run")
-    def test_combine_failure_raises(
-        self, mock_subprocess, mock_backend_cls, plugin_config
-    ):  # noqa: ARG002
-        # Regression: previously a non-zero combine swallowed the failure
-        # as a UserWarning. Now must raise so CI fails loudly instead of
-        # producing silently-empty coverage reports.
-        mock_subprocess.return_value = MagicMock(
-            returncode=1, stderr="coverage: error happened", stdout=""
+            return
+        if not host_import:
+            # The tests only drive the container: the host measures nothing.
+            pytester.makepyfile(test_x="def test_x():\n    pass\n")
+            return
+        pytester.makepyfile(
+            test_x="import sys\nsys.path.insert(0, 'src')\n\ndef test_x():\n    import host_mod\n    assert host_mod.X == 1\n"
         )
-        plugin = ContainerCovPlugin(plugin_config)
-        container = ContainerInfo(
-            id="abc123",
-            name="t",
-            image="samcli/lambda:3.12",
-            labels={},
-            status="exited",
-        )
-        plugin.backend.find_containers.return_value = [container]
-        plugin.backend.extract_matching_files.return_value = []
 
-        mock_session = MagicMock()
-        mock_session.config.rootpath = Path("/project")
+    def test_container_data_lands_in_pytest_covs_report(self, pytester):
+        self._project(pytester, extract=True)
+        result = pytester.runpytest_subprocess("--cov=src", "--cov-report=term-missing")
+        assert result.ret == 0
+        result.stdout.re_match_lines([r".*container_app\.py\s+2\s+0\s+100%"])
 
-        with pytest.raises(RuntimeError, match="coverage combine failed"):
-            plugin.pytest_sessionfinish(mock_session, exitstatus=0)
+    @pytest.mark.parametrize("explicit", [False, True], ids=["at-end", "fixture-teardown"])
+    def test_container_data_silences_the_hosts_no_data_warning(self, pytester, explicit):
+        # coverage checks only the host's own (empty) data at save time; the
+        # container's data is the coverage this run exists for.
+        self._project(pytester, extract=True, host_import=False, explicit=explicit)
+        result = pytester.runpytest_subprocess("--cov=src", "--cov-report=term-missing")
+        assert result.ret == 0
+        result.stdout.re_match_lines([r".*container_app\.py\s+2\s+0\s+100%"])
+        assert "No data was collected" not in result.stdout.str() + result.stderr.str()
 
-    @pytest.mark.filterwarnings("ignore:No coverage data found")
-    @patch("pytest_cov_container.plugin.DockerBackend")
-    @patch("subprocess.run")
-    def test_writes_paths_config(
-        self, mock_subprocess, mock_backend_cls, plugin_config
-    ):  # noqa: ARG002
-        mock_subprocess.return_value = MagicMock(returncode=0, stderr="", stdout="")
-        plugin = ContainerCovPlugin(plugin_config)
-        container = ContainerInfo(
-            id="abc123",
-            name="test",
-            image="samcli/lambda:3.12",
-            labels={},
-            status="exited",
-        )
-        plugin.backend.find_containers.return_value = [container]
-        plugin.backend.extract_matching_files.return_value = []
+    def test_no_data_warning_stays_when_containers_yield_nothing(self, pytester):
+        self._project(pytester, extract=False, host_import=False)
+        result = pytester.runpytest_subprocess("--cov=src", "--cov-report=term-missing")
+        assert "No data was collected" in result.stdout.str() + result.stderr.str()
 
-        mock_session = MagicMock()
-        mock_session.config.rootpath = Path("/project")
+    def test_required_fails_the_run_when_no_data(self, pytester):
+        self._project(pytester, extract=False)
+        result = pytester.runpytest_subprocess("--cov=src", "--cov-container-required")
+        assert result.ret == 1
+        result.stdout.fnmatch_lines(["*yielded no coverage data*"])
 
-        plugin.pytest_sessionfinish(mock_session, exitstatus=0)
-
-        rc_path = plugin.coverage_dir / ".coveragerc"
-        assert rc_path.exists()
-        content = rc_path.read_text()
-        assert "src/api" in content
-        assert "/var/task" in content
+    def test_inactive_without_cov(self, pytester):
+        self._project(pytester, extract=True)
+        result = pytester.runpytest_subprocess()
+        assert result.ret == 0
+        assert not (pytester.path / "build" / ".coveragerc").exists()
 
 
 class TestPytestConfigure:

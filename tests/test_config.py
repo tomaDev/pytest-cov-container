@@ -45,6 +45,38 @@ class TestLoadConfig:
         assert result.driver_config is not None
         assert result.driver_config.build_dir == ".aws-sam/build/ApiFunction"
 
+    def test_empty_section_selects_this_checkouts_sam_lambda_containers(self, tmp_path):
+        pyproject = tmp_path / "pyproject.toml"
+        pyproject.write_text("[tool.pytest-cov-container]\n")
+        result = config.load_config(pyproject)
+        assert result is not None
+        assert result.label == "sam.cli.container.type=lambda"
+        # The build root: every function's build dir sits under it.
+        assert result.mount_prefix == ".aws-sam/build"
+
+    def test_mount_prefix_default_follows_build_dir(self, tmp_path):
+        pyproject = tmp_path / "pyproject.toml"
+        pyproject.write_text('[tool.pytest-cov-container.python]\nbuild_dir = "out/sam/Fn"\n')
+        result = config.load_config(pyproject)
+        assert result is not None
+        assert result.mount_prefix == "out/sam"
+
+    def test_empty_strings_switch_the_sam_defaults_off(self, tmp_path):
+        pyproject = tmp_path / "pyproject.toml"
+        pyproject.write_text('[tool.pytest-cov-container]\nlabel = ""\nmount_prefix = ""\n')
+        result = config.load_config(pyproject)
+        assert result is not None
+        assert not result.label
+        assert not result.mount_prefix
+
+    def test_explicit_keys_override_the_sam_defaults(self, tmp_path):
+        pyproject = tmp_path / "pyproject.toml"
+        pyproject.write_text('[tool.pytest-cov-container]\nlabel = "app=x"\nmount_prefix = "build"\n')
+        result = config.load_config(pyproject)
+        assert result is not None
+        assert result.label == "app=x"
+        assert result.mount_prefix == "build"
+
     def test_disabled_config(self, tmp_path):
         pyproject = tmp_path / "pyproject.toml"
         pyproject.write_text("[tool.pytest-cov-container]\nenabled = false\n")
