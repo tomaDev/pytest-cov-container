@@ -5,6 +5,7 @@ import threading
 import time
 import uuid
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import coverage
@@ -75,6 +76,12 @@ class ContainerCovPlugin:
     ):
         if not plugin_config.targets:
             msg = "PluginConfig.targets is empty"
+            raise ValueError(msg)
+        container_roots = {target.container_root for target in plugin_config.targets}
+        if len(container_roots) > 1:
+            # container_env() is one dict shared by every container this
+            # process starts, so RCFILE_ENV can only encode one container_root.
+            msg = f"PluginConfig.targets have different container_root values: {sorted(container_roots)}"
             raise ValueError(msg)
         self.config = plugin_config
         self.rootpath = rootpath
@@ -185,7 +192,7 @@ class ContainerCovPlugin:
             return 0, 0
         running = [c for c in self.find_owned() if c.status == "running"]
         since = time.monotonic()
-        signalled = [c for c in running if self.backend.send_signal(c.id) > 0]
+        signalled = self._signal(running)
         deadline = since + _FLUSH_TIMEOUT_S
         pushed = 0
         for container in signalled:
@@ -199,6 +206,34 @@ class ContainerCovPlugin:
                     stacklevel=3,
                 )
         return len(signalled), pushed
+
+    def _signal(self, containers: list[ContainerInfo]) -> list[ContainerInfo]:
+        """SIGUSR1 the containers on a small thread pool; returns those signalled.
+
+        Each signal is a ``docker exec`` round-trip; fanning them out cuts the
+        wait from O(N * RTT) to ~RTT. A container that fails is warned (here, on
+        the calling thread, where pytest captures warnings) and does not block
+        the rest. One without a coverage process is skipped quietly: a
+        framework label also matches containers of functions it does not
+        instrument (a non-Python runtime), and ``required`` catches a run
+        where no container pushed.
+        """
+        if not containers:
+            return []
+        with ThreadPoolExecutor(max_workers=min(8, len(containers))) as ex:
+            futures = [(c, ex.submit(self.backend.send_signal, c.id)) for c in containers]
+        signalled: list[ContainerInfo] = []
+        for container, future in futures:
+            try:
+                if future.result():
+                    signalled.append(container)
+            except Exception as exc:  # noqa: BLE001 — surface, don't crash
+                warnings.warn(
+                    f"pytest-cov-container: could not signal {container.name} ({container.id[:12]}): {exc}",
+                    UserWarning,
+                    stacklevel=4,
+                )
+        return signalled
 
     def _ownership_desc(self) -> str:
         parts = [f"matching image {self.config.image_patterns or 'any'}"]

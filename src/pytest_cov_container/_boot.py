@@ -11,12 +11,14 @@ import atexit
 import functools
 import importlib.abc
 import importlib.util
+import inspect
 import os
 import signal
 import socket
 import sys
 import threading
 import urllib.request
+from pathlib import Path
 
 # Mirrors of ``pytest_cov_container.protocol`` (a test keeps them equal).
 RCFILE_ENV = "COVERAGE_PROCESS_START"
@@ -83,6 +85,19 @@ class _WrapHandler:
     def _wrap(self, handler):
         after_call = self.after_call
 
+        if inspect.iscoroutinefunction(handler):
+            # An async handler only runs once its coroutine is awaited; the
+            # runtime does that after this call returns, so the push has to
+            # wait for it too, or it ships the invocation's coverage early.
+            @functools.wraps(handler)
+            async def wrapped(*args, **kwargs):
+                try:
+                    return await handler(*args, **kwargs)
+                finally:
+                    after_call()
+
+            return wrapped
+
         @functools.wraps(handler)
         def wrapped(*args, **kwargs):
             try:
@@ -104,8 +119,7 @@ def _handler_target(handler: str) -> tuple[str, str] | None:
 def start(rcfile: str, sink: str, here: str) -> None:
     coverage = _import_coverage(here)
     try:
-        with open(os.path.join(here, BOOT_CONFIG)) as f:
-            function = f.read().strip()
+        function = (Path(here) / BOOT_CONFIG).read_text().strip()
     except OSError:
         function = ""
 
@@ -135,8 +149,7 @@ def start(rcfile: str, sink: str, here: str) -> None:
         except Exception as exc:  # noqa: BLE001 — never break the function under test
             print(f"pytest-cov-container: coverage push failed: {exc!r}", file=sys.stderr)  # noqa: T201 — the container's log is the only channel
 
-    with open(os.environ.get(PID_FILE_ENV, PID_FILE), "w") as f:
-        f.write(str(os.getpid()))
+    Path(os.environ.get(PID_FILE_ENV, PID_FILE)).write_text(str(os.getpid()))
     signal.signal(signal.SIGUSR1, push_quietly)
     atexit.register(push_quietly)
     target = _handler_target(os.environ.get("_HANDLER", ""))
@@ -148,6 +161,6 @@ def main() -> None:
     """Entry point; the injected ``.pth`` calls it at interpreter startup."""
     rcfile = os.environ.get(RCFILE_ENV)
     sink = os.environ.get(SINK_ENV)
-    if not rcfile or not sink or not os.path.isfile(rcfile):
+    if not rcfile or not sink or not Path(rcfile).is_file():
         return
-    start(rcfile, sink, os.path.dirname(os.path.abspath(__file__)))
+    start(rcfile, sink, str(Path(__file__).resolve().parent))

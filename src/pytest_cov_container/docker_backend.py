@@ -1,6 +1,5 @@
 import re
 import sys
-import warnings
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -99,24 +98,17 @@ class DockerBackend:
             raise RuntimeError(msg)
         return gateway, gateway
 
-    def send_signal(self, container_id: str) -> int:
+    def send_signal(self, container_id: str) -> bool:
         """Send SIGUSR1 (push your coverage) to the process named by the pid file.
 
-        Returns 1 when signalled, 0 when the container has no coverage process
-        (no pid file, or the pid is gone), -1 on a docker API error.
+        Returns False when the container has no coverage process (no pid file,
+        or the pid is gone). Docker errors propagate: the caller may run this on
+        a worker thread and warns on its own thread, where pytest captures it.
         """
-        try:
-            container = self._client.containers.get(container_id)
-            _, output = container.exec_run(_SIGNAL_CMD)
-        except docker.errors.APIError as exc:
-            warnings.warn(
-                f"Failed to send signal to container {container_id[:12]}: {exc}",
-                UserWarning,
-                stacklevel=2,
-            )
-            return -1
+        container = self._client.containers.get(container_id)
+        _, output = container.exec_run(_SIGNAL_CMD)
         match = _SIGNALLED_RE.search(output or b"")
-        return int(match.group(1)) if match else 0
+        return bool(match and match.group(1) == b"1")
 
     @staticmethod
     def _config_image(container) -> str:

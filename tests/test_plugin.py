@@ -1,3 +1,4 @@
+import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -204,6 +205,36 @@ class TestFlush:
         plugin = self._plugin(make_plugin, sam_project, [_container()], pushes=False)
         with pytest.warns(UserWarning, match="did not push its coverage"):
             assert plugin.collect_from_running() == 0
+
+    def test_signals_containers_concurrently(self, make_plugin, sam_project):
+        # Each signal waits for the other: a sequential flush breaks the barrier.
+        containers = [_container("aaaaaaaaaaaa0000"), _container("bbbbbbbbbbbb0000")]
+        plugin = self._plugin(make_plugin, sam_project, containers, pushes=False)
+        barrier = threading.Barrier(2, timeout=5)
+
+        def send_signal(container_id):
+            barrier.wait()
+            ident = f"{container_id[:12]}-1"
+            plugin._on_push(ident, "ApiFunction", _data(sam_project / ident, {"/var/task/app.py": [1]}))
+            plugin.sink._record(ident)
+            return True
+
+        plugin.backend.send_signal.side_effect = send_signal
+        assert plugin.collect_from_running() == 2
+
+    def test_a_failing_signal_warns_and_the_rest_still_flush(self, make_plugin, sam_project):
+        containers = [_container("aaaaaaaaaaaa0000"), _container()]
+        plugin = self._plugin(make_plugin, sam_project, containers, pushes=True)
+        pushing = plugin.backend.send_signal.side_effect
+
+        def send_signal(container_id):
+            if container_id.startswith("aaaa"):
+                raise docker.errors.APIError("engine down")
+            return pushing(container_id)
+
+        plugin.backend.send_signal.side_effect = send_signal
+        with pytest.warns(UserWarning, match=r"could not signal sam-aaaa \(aaaaaaaaaaaa\): engine down"):
+            assert plugin.collect_from_running() == 1
 
     def test_required_raises_when_nothing_was_received(self, make_plugin, sam_project, monkeypatch):
         monkeypatch.setattr("pytest_cov_container.plugin._FLUSH_TIMEOUT_S", 0.1)

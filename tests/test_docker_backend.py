@@ -98,16 +98,15 @@ class TestSendSignal:
         backend = DockerBackend(client=mock_docker_client)
         assert backend.send_signal(mock_docker_container.id) == 0
 
-    def test_minus_one_and_warning_on_api_error(
-        self, mock_docker_client, mock_docker_container
-    ):
+    def test_api_error_propagates(self, mock_docker_client, mock_docker_container):
+        # The plugin signals on worker threads and warns on its own thread.
         import docker.errors
         import pytest
 
         mock_docker_container.exec_run.side_effect = docker.errors.APIError("down")
         backend = DockerBackend(client=mock_docker_client)
-        with pytest.warns(UserWarning, match="Failed to send signal"):
-            assert backend.send_signal(mock_docker_container.id) == -1
+        with pytest.raises(docker.errors.APIError, match="down"):
+            backend.send_signal(mock_docker_container.id)
 
     def test_signal_script_runs_in_posix_sh(self, tmp_path):
         # Execute the real script against a live process in a local sh, with
