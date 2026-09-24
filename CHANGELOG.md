@@ -1,6 +1,18 @@
 # Changelog
 
-## 0.4.0 — 2026-09-24
+## 0.4.1 — 2026-09-24
+
+First PyPI release of the 0.4.0 changes below. The 0.4.0 tag exists but was
+never published: its release workflow failed.
+
+### Fixed
+
+- **Release workflow**: the tag/version check imported
+  `src.pytest_cov_container.__about__`, which runs the package `__init__.py`
+  before the package is installed (`ModuleNotFoundError`). It now reads
+  `__about__.py` with `runpy.run_path`.
+
+## 0.4.0 — 2026-09-24 (not published)
 
 Makes the plugin usable with `sam local` under pytest-xdist and with several
 checkouts of one project running at once. Driven by a SAM project that had

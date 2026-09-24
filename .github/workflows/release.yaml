@@ -68,7 +68,9 @@ jobs:
 
       - name: Validate package version matches tag version
         run: |
-          PACKAGE_VERSION="$(python -c 'from src.pytest_cov_container.__about__ import __version__;print(__version__)')"
+          # Run __about__.py directly: importing it via the package runs
+          # __init__.py, which needs the (not yet installed) package itself.
+          PACKAGE_VERSION="$(python -c 'import runpy;print(runpy.run_path("src/pytest_cov_container/__about__.py")["__version__"])')"
           TAG_VERSION="${{ steps.get.outputs.NEW_VERSION }}"
           if [ "$PACKAGE_VERSION" != "$TAG_VERSION" ]; then
               echo "Version mismatch: (package internal) $PACKAGE_VERSION != $TAG_VERSION (tag)"
