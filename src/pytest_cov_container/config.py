@@ -1,31 +1,34 @@
-from dataclasses import dataclass, field
+import tomllib
+from dataclasses import dataclass
 from pathlib import Path
 
-import tomllib
+from pytest_cov_container import frameworks
+from pytest_cov_container.frameworks import FunctionTarget
 
-from pytest_cov_container.models import DriverConfig
-
-# SAM CLI 1.165+ labels every container ``sam local`` starts for a function.
-SAM_LAMBDA_LABEL = "sam.cli.container.type=lambda"
-DEFAULT_BUILD_DIR = ".aws-sam/build/ApiFunction"
+_SECTION = "[tool.pytest-cov-container]"
 
 
 @dataclass
 class PluginConfig:
+    framework: str | None = None
+    targets: tuple[FunctionTarget, ...] = ()
     image_pattern: str | list[str] | None = None
-    # Built for ``sam local``: the defaults select SAM's Lambda containers, and
-    # ``load_config`` defaults ``mount_prefix`` to the SAM build root. An empty
-    # string switches either filter off.
-    label: str | None = SAM_LAMBDA_LABEL
-    language: str = "python"
+    label: str | None = None
     enabled: bool = True
-    path_mapping: dict[str, str] = field(default_factory=dict)
-    driver_config: DriverConfig | None = None
     # Ownership keys — see ``pytest_cov_container.ownership``.
     mount_prefix: str | None = None
     worker_env: str | None = None
     # Fail the run when a collection pass gets no coverage data.
     required: bool = False
+    # Branch coverage in the containers; ``None`` inherits the host's setting,
+    # which it must match to combine.
+    branch: bool | None = None
+    # Where containers reach the sink (the host), and where the sink listens.
+    # ``None``: detected from the Docker engine (``DockerBackend.host_endpoint``).
+    sink_host: str | None = None
+    sink_bind: str | None = None
+    # The docker network the containers join, for that detection (default: bridge).
+    docker_network: str | None = None
 
     @property
     def image_patterns(self) -> list[str]:
@@ -40,7 +43,8 @@ def _optional_bool(section: dict, key: str) -> bool | None:
     value = section.get(key)
     if value is None or isinstance(value, bool):
         return value
-    raise ValueError(f"[tool.pytest-cov-container] {key} must be true or false, got {value!r}")
+    msg = f"{_SECTION} {key} must be true or false, got {value!r}"
+    raise ValueError(msg)
 
 
 def load_config(pyproject_path: Path) -> PluginConfig | None:
@@ -54,47 +58,20 @@ def load_config(pyproject_path: Path) -> PluginConfig | None:
     if tool_config is None:
         return None
 
-    path_mapping = {
-        str(k): str(v) for k, v in tool_config.get("path_mapping", {}).items()
-    }
-
-    plugin_config = PluginConfig(
+    framework = tool_config.get("framework")
+    # The framework's defaults; every key set explicitly below wins over them.
+    preset = frameworks.defaults(framework, tool_config, pyproject_path.parent)
+    return PluginConfig(
+        framework=framework,
+        targets=preset.targets,
         image_pattern=tool_config.get("image_pattern"),
-        label=tool_config.get("label", SAM_LAMBDA_LABEL),
-        language=tool_config.get("language", "python"),
+        label=tool_config.get("label", preset.label),
         enabled=tool_config.get("enabled", True),
-        path_mapping=path_mapping,
+        mount_prefix=tool_config.get("mount_prefix", preset.mount_prefix),
         worker_env=tool_config.get("worker_env"),
         required=bool(_optional_bool(tool_config, "required")),
+        branch=_optional_bool(tool_config, "branch"),
+        sink_host=tool_config.get("sink_host"),
+        sink_bind=tool_config.get("sink_bind"),
+        docker_network=tool_config.get("docker_network"),
     )
-
-    driver_section = tool_config.get(plugin_config.language, {})
-    entrypoint = driver_section.get("entrypoint")
-    if entrypoint == "":
-        raise ValueError(
-            "[tool.pytest-cov-container.python].entrypoint is empty. "
-            "Remove the field to use convention discovery, or set a non-empty command."
-        )
-    wrapper = _optional_bool(driver_section, "wrapper")
-    if wrapper is False and entrypoint is not None:
-        raise ValueError(
-            "[tool.pytest-cov-container.python]: entrypoint needs the wrapper; "
-            "remove entrypoint or wrapper = false."
-        )
-    relative_files = _optional_bool(driver_section, "relative_files")
-    build_dir = driver_section.get("build_dir", DEFAULT_BUILD_DIR)
-    # SAM builds each function into ``<build root>/<LogicalId>``, so the build
-    # root covers every function of this checkout and no other checkout's.
-    plugin_config.mount_prefix = tool_config.get("mount_prefix", Path(build_dir).parent.as_posix())
-    plugin_config.driver_config = DriverConfig(
-        build_dir=build_dir,
-        entrypoint=entrypoint,
-        path_mapping=path_mapping,
-        wrapper=wrapper is not False,
-        source_dir=driver_section.get("source_dir"),
-        container_root=driver_section.get("container_root", "/var/task"),
-        branch=_optional_bool(driver_section, "branch"),
-        relative_files=relative_files is not False,
-    )
-
-    return plugin_config

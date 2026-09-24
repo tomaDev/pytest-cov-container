@@ -1,5 +1,4 @@
-import io
-import tarfile
+import pytest
 
 from pytest_cov_container.docker_backend import DockerBackend
 
@@ -67,7 +66,8 @@ class TestFindContainers:
         import docker
 
         def boom():
-            raise AssertionError("docker.from_env called at construction")
+            msg = "docker.from_env called at construction"
+            raise AssertionError(msg)
 
         monkeypatch.setattr(docker, "from_env", boom)
         DockerBackend()
@@ -83,12 +83,6 @@ class TestSendSignal:
         script = mock_docker_container.exec_run.call_args[0][0][-1]
         assert "/tmp/.cov_container.pid" in script
         assert "kill -USR1" in script
-
-    def test_clears_the_old_sentinel_before_signalling(self):
-        from pytest_cov_container.docker_backend import _SIGNAL_CMD
-
-        script = _SIGNAL_CMD[-1]
-        assert script.index("rm -f /tmp/.cov_container.done") < script.index("kill")
 
     def test_never_scans_proc_cmdline(self):
         # A /proc scan's own `sh -c` carries the search token, matches itself
@@ -125,9 +119,8 @@ class TestSendSignal:
 
         from pytest_cov_container.docker_backend import _SIGNAL_CMD
 
-        pid_file, done_file = tmp_path / "pid", tmp_path / "done"
-        done_file.write_text("")  # stale sentinel from a previous save
-        target = subprocess.Popen(  # noqa: S603
+        pid_file = tmp_path / "pid"
+        target = subprocess.Popen(
             [
                 sys.executable,
                 "-c",
@@ -139,164 +132,55 @@ class TestSendSignal:
         try:
             time.sleep(0.3)
             pid_file.write_text(str(target.pid))
-            script = (
-                _SIGNAL_CMD[-1]
-                .replace("/tmp/.cov_container.pid", str(pid_file))
-                .replace("/tmp/.cov_container.done", str(done_file))
-            )
-            out = subprocess.run(  # noqa: S603
-                ["sh", "-c", script], capture_output=True, text=True, timeout=5
+            script = _SIGNAL_CMD[-1].replace("/tmp/.cov_container.pid", str(pid_file))
+            out = subprocess.run(
+                ["sh", "-c", script], check=False, capture_output=True, text=True, timeout=5
             )
             assert out.stdout.strip() == "signalled=1"
             assert target.wait(timeout=5) == 7
-            assert not done_file.exists()
         finally:
             if target.poll() is None:
                 target.send_signal(signal.SIGKILL)
                 target.wait()
 
         pid_file.unlink()
-        out = subprocess.run(  # noqa: S603
-            ["sh", "-c", script], capture_output=True, text=True, timeout=5
+        out = subprocess.run(
+            ["sh", "-c", script], check=False, capture_output=True, text=True, timeout=5
         )
         assert out.stdout.strip() == "signalled=0"
 
 
-class TestWaitForDone:
-    def test_true_once_sentinel_exists(
-        self, mock_docker_client, mock_docker_container
-    ):
-        mock_docker_container.exec_run.side_effect = [(1, b""), (0, b"")]
-        backend = DockerBackend(client=mock_docker_client)
-        assert backend.wait_for_done(
-            mock_docker_container.id, timeout=1.0, interval=0.01
-        )
-        cmd = mock_docker_container.exec_run.call_args[0][0]
-        assert cmd == ["test", "-f", "/tmp/.cov_container.done"]
+class TestHostEndpoint:
+    @staticmethod
+    def _backend(mock_docker_client, engine: str, gateway: str | None = "172.17.0.1"):
+        mock_docker_client.info.return_value = {"OperatingSystem": engine}
+        config = [{"Subnet": "172.17.0.0/16", "Gateway": gateway}] if gateway else [{"Subnet": "172.17.0.0/16"}]
+        mock_docker_client.networks.get.return_value.attrs = {"IPAM": {"Config": config}}
+        return DockerBackend(client=mock_docker_client)
 
-    def test_false_on_timeout(self, mock_docker_client, mock_docker_container):
-        mock_docker_container.exec_run.return_value = (1, b"")
-        backend = DockerBackend(client=mock_docker_client)
-        assert not backend.wait_for_done(
-            mock_docker_container.id, timeout=0.05, interval=0.01
-        )
+    @pytest.mark.parametrize("engine", ["Docker Desktop", "OrbStack"])
+    def test_desktop_engines_forward_to_loopback(self, mock_docker_client, engine):
+        backend = self._backend(mock_docker_client, engine)
+        assert backend.host_endpoint(platform="linux") == ("127.0.0.1", "host.docker.internal")
+        mock_docker_client.networks.get.assert_not_called()
 
+    def test_any_engine_on_a_macos_host_is_vm_based(self, mock_docker_client):
+        # colima, podman machine, Rancher Desktop: the engine reports its VM's OS.
+        backend = self._backend(mock_docker_client, "Ubuntu 24.04 LTS")
+        assert backend.host_endpoint(platform="darwin") == ("127.0.0.1", "host.docker.internal")
 
-class TestExtractMatchingFiles:
-    def _make_tar_bytes(self, files: dict[str, bytes]) -> bytes:
-        """Create tar bytes with given filename->content mapping."""
-        buf = io.BytesIO()
-        with tarfile.open(fileobj=buf, mode="w") as tar:
-            for name, content in files.items():
-                info = tarfile.TarInfo(name=name)
-                info.size = len(content)
-                tar.addfile(info, io.BytesIO(content))
-        return buf.getvalue()
+    def test_linux_engine_uses_the_bridge_gateway(self, mock_docker_client):
+        backend = self._backend(mock_docker_client, "Ubuntu 24.04 LTS")
+        assert backend.host_endpoint(platform="linux") == ("172.17.0.1", "172.17.0.1")
+        mock_docker_client.networks.get.assert_called_once_with("bridge")
 
-    def test_extracts_matching_files(
-        self, mock_docker_client, mock_docker_container, tmp_path
-    ):
-        tar_data = self._make_tar_bytes(
-            {
-                "tmp/.coverage.container.host.123.abc": b"cov-data-1",
-                "tmp/.coverage.container.host.456.def": b"cov-data-2",
-                "tmp/other_file.txt": b"not coverage",
-            }
-        )
-        mock_docker_container.get_archive.return_value = (iter([tar_data]), {})
-        backend = DockerBackend(client=mock_docker_client)
+    def test_linux_engine_with_a_custom_network(self, mock_docker_client):
+        backend = self._backend(mock_docker_client, "Debian GNU/Linux 12", gateway="172.20.0.1")
+        assert backend.host_endpoint("sam-net", platform="linux") == ("172.20.0.1", "172.20.0.1")
+        mock_docker_client.networks.get.assert_called_once_with("sam-net")
 
-        extracted = backend.extract_matching_files(
-            mock_docker_container.id, "/tmp", ".coverage.container", tmp_path
-        )
+    def test_a_network_without_a_gateway_asks_for_the_overrides(self, mock_docker_client):
+        backend = self._backend(mock_docker_client, "Ubuntu 24.04 LTS", gateway=None)
+        with pytest.raises(RuntimeError, match="set sink_bind and sink_host"):
+            backend.host_endpoint(platform="linux")
 
-        assert len(extracted) == 2
-        assert all(p.exists() for p in extracted)
-        # Prefixed with the container id: two containers' same-named files
-        # must not overwrite each other in a shared destination.
-        assert (
-            tmp_path / "abc123def456-.coverage.container.host.123.abc"
-        ).read_bytes() == b"cov-data-1"
-
-    def test_skips_sqlite_side_files(
-        self, mock_docker_client, mock_docker_container, tmp_path
-    ):
-        tar_data = self._make_tar_bytes(
-            {
-                "tmp/.coverage.container.h.1.a": b"db",
-                "tmp/.coverage.container.h.1.a-journal": b"j",
-            }
-        )
-        mock_docker_container.get_archive.return_value = (iter([tar_data]), {})
-        backend = DockerBackend(client=mock_docker_client)
-        extracted = backend.extract_matching_files(
-            mock_docker_container.id, "/tmp", ".coverage.container", tmp_path
-        )
-        assert [p.name for p in extracted] == ["abc123def456-.coverage.container.h.1.a"]
-
-    def test_returns_empty_when_no_match(
-        self, mock_docker_client, mock_docker_container, tmp_path
-    ):
-        tar_data = self._make_tar_bytes({"tmp/unrelated.txt": b"data"})
-        mock_docker_container.get_archive.return_value = (iter([tar_data]), {})
-        backend = DockerBackend(client=mock_docker_client)
-
-        extracted = backend.extract_matching_files(
-            mock_docker_container.id, "/tmp", ".coverage.container", tmp_path
-        )
-        assert extracted == []
-
-    def _make_tar_with_traversal(self) -> bytes:
-        """Tar with a member whose name claims to escape into the host."""
-        buf = io.BytesIO()
-        with tarfile.open(fileobj=buf, mode="w") as tar:
-            info = tarfile.TarInfo(name="../../etc/.coverage.container.evil")
-            info.size = 4
-            tar.addfile(info, io.BytesIO(b"PWND"))
-            # Plus one benign entry so we can confirm benign extraction works.
-            ok = tarfile.TarInfo(name="tmp/.coverage.container.ok")
-            ok.size = 4
-            tar.addfile(ok, io.BytesIO(b"data"))
-        return buf.getvalue()
-
-    def _make_tar_with_symlink(self) -> bytes:
-        """Tar with a symlink member whose name matches the prefix."""
-        buf = io.BytesIO()
-        with tarfile.open(fileobj=buf, mode="w") as tar:
-            link = tarfile.TarInfo(name="tmp/.coverage.container.linky")
-            link.type = tarfile.SYMTYPE
-            link.linkname = "/etc/passwd"
-            tar.addfile(link)
-        return buf.getvalue()
-
-    def test_rejects_path_traversal_member(
-        self, mock_docker_client, mock_docker_container, tmp_path
-    ):
-        # Regression: a malicious container image could plant a tar member
-        # whose name escapes the destination directory. Even though current
-        # logic writes by basename only, defense-in-depth via PEP 706
-        # data_filter (or 3.11 hand-check) must reject these members.
-        tar_data = self._make_tar_with_traversal()
-        mock_docker_container.get_archive.return_value = (iter([tar_data]), {})
-        backend = DockerBackend(client=mock_docker_client)
-
-        extracted = backend.extract_matching_files(
-            mock_docker_container.id, "/tmp", ".coverage.container", tmp_path
-        )
-        # Benign member extracts; traversal member is filtered out.
-        assert len(extracted) == 1
-        assert extracted[0].name == "abc123def456-.coverage.container.ok"
-        # And no escape file under tmp_path's parent.
-        assert not (tmp_path.parent / ".coverage.container.evil").exists()
-
-    def test_rejects_symlink_member(
-        self, mock_docker_client, mock_docker_container, tmp_path
-    ):
-        tar_data = self._make_tar_with_symlink()
-        mock_docker_container.get_archive.return_value = (iter([tar_data]), {})
-        backend = DockerBackend(client=mock_docker_client)
-
-        extracted = backend.extract_matching_files(
-            mock_docker_container.id, "/tmp", ".coverage.container", tmp_path
-        )
-        assert extracted == []

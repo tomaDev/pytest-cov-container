@@ -1,5 +1,65 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **Every function, pushed by the containers** (breaking). Collection no
+  longer pulls data out of containers (signal, sentinel, `docker cp`):
+  `sam local invoke` removes its container right after the invoke, so that
+  never worked for one-shot functions. Now the plugin injects into each
+  function's build dir a `.coveragerc`, a pure-Python copy of `coverage`, a
+  bootstrap module and a `.pth` hook; the Lambda runtime runs the hook before
+  it imports the handler. The bootstrap pushes the process's data to an HTTP
+  sink in the pytest process (URL via `container_env()`) after every handler
+  call, and on `SIGUSR1` for long-running servers (`collect_container_coverage()`).
+  Declare `COVERAGE_PROCESS_START` and `COV_CONTAINER_SINK` empty in the
+  template's `Globals`; empty, the bootstrap is inert.
+- **`framework` is required and infers the defaults** (breaking). With
+  `framework = "aws-sam"` the preset reads `template.yaml`: every zip Python
+  function with a local `CodeUri` (or `functions = [...]`), its build dir from
+  `sam build`'s template (functions sharing code share one), its `CodeUri` at
+  `/var/task` and its local layers at `/opt`, the label
+  `sam.cli.container.type=lambda` and the build root as `mount_prefix`.
+  Explicit keys still win. New keys: `functions`, `template`, `build_dir`,
+  `sink_host`, `sink_bind`, `docker_network`, `branch` (top level).
+- **Sink address detected from the Docker engine**: Docker Desktop, OrbStack
+  and engines on macOS/Windows hosts get a loopback sink reached through
+  `host.docker.internal`; a Linux engine (CI) gets a sink on the containers'
+  network gateway (`docker0`), reached by IP with no `--add-host`.
+  `sink_bind` / `sink_host` override; `docker_network` names another network.
+- **Removed** (breaking): the `run.sh` wrapper and `entrypoint` override, the
+  `[python]` section, `path_mapping`, `language` and the driver entry points,
+  `PID_FILE`/`DONE_FILE` exports and the save protocol an application had to
+  implement (`wrapper = false`). New dependency: `pyyaml>=6.0.3` (reads the SAM
+  template, CloudFormation tags tolerated).
+
+### Fixed
+
+- **xdist controller collected too**: whether the process is the xdist
+  controller was decided in `pytest_configure`, where xdist's own `trylast`
+  hook may not have registered `dsession` yet, depending on plugin load order.
+  The controller then ran an end-of-session collection, found no containers
+  of its own and warned "No matching containers found". It is now decided when
+  the session starts (the controller serves no sink).
+
+### Internal
+
+- **Release workflow on Node 24**: `actions/checkout@v7`, `setup-python@v7`,
+  `upload-artifact@v7`, `download-artifact@v8`, `astral-sh/setup-uv@v10.2.0`
+  (setup-uv no longer publishes major tags). Jobs run on `ubuntu-26.04`
+  instead of `ubuntu-latest`, which clears the Ubuntu 26 migration notice.
+  Quoted two shell variables flagged by shellcheck.
+- **Release workflow PyPI check**: the "latest version on PyPI" lookup took
+  the first key under `releases` (the oldest version, `0.0.1`), so the
+  "newer than PyPI" guard always passed. It now reads `.info.version`.
+- **Release workflow hardening** (zizmor, clean under `--persona pedantic`):
+  actions pinned to commit SHAs; `permissions: {}` at the top with each job
+  granted only what it uses; `persist-credentials: false` on checkouts; no
+  uv cache in the build job (cache poisoning); step outputs passed through
+  `env:` instead of `${{ }}` inside `run:`; a `release` concurrency group
+  that never cancels a run in progress.
+
 ## 0.4.1 — 2026-09-24
 
 First PyPI release of the 0.4.0 changes below. The 0.4.0 tag exists but was

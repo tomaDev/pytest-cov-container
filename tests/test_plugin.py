@@ -1,335 +1,358 @@
-import stat
-import subprocess
-import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import coverage
+import docker.errors
 import pytest
 from coverage.data import CoverageData
 
-from pytest_cov_container.config import PluginConfig
-from pytest_cov_container.drivers.python import PythonDriver
-from pytest_cov_container.models import ContainerInfo, DriverConfig
+from pytest_cov_container import config, protocol
+from pytest_cov_container.models import ContainerInfo
 from pytest_cov_container.plugin import ContainerCovPlugin
 
 
 @pytest.fixture
-def plugin_config():
-    return PluginConfig(
-        image_pattern="samcli/lambda*",
-        language="python",
-        enabled=True,
-        driver_config=DriverConfig(build_dir=".aws-sam/build/ApiFunction"),
+def plugin_config(sam_project):
+    (sam_project / "pyproject.toml").write_text(
+        '[tool.pytest-cov-container]\nframework = "aws-sam"\nworker_env = "MARK"\n'
+        'sink_host = "127.0.0.1"\nsink_bind = "127.0.0.1"\n'
     )
+    loaded = config.load_config(sam_project / "pyproject.toml")
+    assert loaded is not None
+    return loaded
 
 
 @pytest.fixture
-def make_plugin(plugin_config, tmp_path, monkeypatch):
+def make_plugin(plugin_config, sam_project, monkeypatch):
     """A plugin with a mocked docker backend; pytest-cov's data file is
-    ``tmp_path/.coverage`` (the outer run's own Coverage is hidden)."""
+    ``<sam_project>/.coverage`` (the outer run's own Coverage is hidden)."""
     monkeypatch.setattr(coverage.Coverage, "current", classmethod(lambda cls: None))
-    monkeypatch.setenv("COVERAGE_FILE", str(tmp_path / ".coverage"))
+    monkeypatch.setenv("COVERAGE_FILE", str(sam_project / ".coverage"))
     monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
+    made = []
 
     def make(**kwargs):
         with patch("pytest_cov_container.plugin.DockerBackend"):
-            return ContainerCovPlugin(plugin_config, tmp_path, **kwargs)
+            plugin = ContainerCovPlugin(plugin_config, sam_project, **kwargs)
+        made.append(plugin)
+        return plugin
 
-    return make
+    yield make
+    for plugin in made:
+        if plugin.sink is not None:
+            plugin.sink.stop()
 
 
-def _container(cid="c0", status="running"):
-    return ContainerInfo(id=cid, name=f"sam-{cid}", image="samcli/lambda:3.12", labels={}, status=status)
+def _session(root: Path, *, controller: bool = False):
+    session = MagicMock()
+    session.testsfailed = 0
+    session.config.rootpath = root
+    session.config.pluginmanager.hasplugin.side_effect = lambda name: controller and name == "dsession"
+    return session
 
 
-def _data_file(path: Path, lines: dict[str, list[int]]) -> Path:
+def _data(path: Path, lines: dict[str, list[int]]) -> bytes:
     data = CoverageData(basename=str(path))
     data.add_lines(lines)
-    data.close()
-    return path
+    data.write()
+    return path.read_bytes()
 
 
-def _stub_collect(plugin, files_by_id: dict[str, list[Path]]):
-    plugin.driver = MagicMock()
-    plugin.driver.collect.side_effect = lambda backend, container, dest, cfg: files_by_id.get(container.id, [])
+def _container(cid="abc123def4560000", status="running"):
+    return ContainerInfo(id=cid, name=f"sam-{cid[:4]}", image="x", labels={}, status=status)
 
 
 class TestSessionStart:
-    def test_injects_when_build_dir_exists(self, make_plugin, plugin_config, tmp_path):
-        build_dir = tmp_path / ".aws-sam" / "build" / "ApiFunction"
-        build_dir.mkdir(parents=True)
-        plugin_config.driver_config.wrapper = False
+    def test_injects_every_target_and_starts_the_sink(self, make_plugin, sam_project):
         plugin = make_plugin()
-        session = MagicMock()
-        session.config.rootpath = tmp_path
-        plugin.pytest_sessionstart(session)
-        assert plugin.injection_result is not None
-        assert (build_dir / ".coveragerc").exists()
+        plugin.pytest_sessionstart(_session(sam_project))
+        for function in ("ApiFunction", "Worker"):
+            assert (sam_project / ".aws-sam/build" / function / protocol.PTH_FILE).is_file()
+        assert plugin.sink is not None
 
-    def test_raises_when_build_dir_missing(self, make_plugin, tmp_path):
-        plugin = make_plugin()
-        session = MagicMock()
-        session.config.rootpath = tmp_path
-        with pytest.raises(FileNotFoundError, match="does not exist"):
-            plugin.pytest_sessionstart(session)
-
-    def test_xdist_worker_does_not_inject(self, make_plugin, tmp_path):
+    def test_xdist_worker_serves_but_does_not_inject(self, make_plugin, sam_project):
         # The controller injected before spawning workers; a worker rewriting
         # the files could race a sibling's starting container.
         plugin = make_plugin(is_worker=True)
-        session = MagicMock()
-        session.config.rootpath = tmp_path
-        plugin.pytest_sessionstart(session)  # build dir missing, yet no raise
-        assert plugin.injection_result is None
+        plugin.pytest_sessionstart(_session(sam_project))
+        assert not (sam_project / ".aws-sam/build/Worker" / protocol.PTH_FILE).exists()
+        assert plugin.sink is not None
 
-
-class TestShardHandoff:
-    def test_shard_is_a_suffix_file_of_pytest_covs_data_file(self, make_plugin, tmp_path):
+    def test_xdist_controller_injects_but_serves_nothing(self, make_plugin, sam_project):
         plugin = make_plugin()
-        src = _data_file(tmp_path / "extracted", {"/var/task/app.py": [1, 2]})
-        plugin._write_shard(src)
-        shards = list(tmp_path.glob(".coverage.container-main-*"))
-        assert len(shards) == 1
-        assert not src.exists()
-        data = CoverageData(basename=str(shards[0]))
-        data.read()
-        assert data.measured_files() == {"/var/task/app.py"}
-        assert not list(tmp_path.glob("*.tmp"))
+        plugin.pytest_sessionstart(_session(sam_project, controller=True))
+        assert (sam_project / ".aws-sam/build/Worker" / protocol.PTH_FILE).is_file()
+        assert plugin.sink is None
 
-    def test_shard_names_carry_the_worker_id(self, make_plugin, tmp_path, monkeypatch):
-        monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw2")
+    def test_missing_build_dir(self, make_plugin, sam_project):
+        (sam_project / ".aws-sam/build/Worker").rmdir()
+        with pytest.raises(FileNotFoundError, match="Run 'sam build'"):
+            make_plugin().pytest_sessionstart(_session(sam_project))
+
+
+class TestSinkAddress:
+    def test_configured_values_skip_detection(self, make_plugin):
         plugin = make_plugin()
-        plugin._write_shard(_data_file(tmp_path / "x", {"/var/task/a.py": [1]}))
-        assert list(tmp_path.glob(".coverage.container-gw2-*"))
+        assert plugin._sink_address() == ("127.0.0.1", "127.0.0.1")
+        plugin.backend.host_endpoint.assert_not_called()
 
-    def test_path_mapping_remaps_container_paths(self, make_plugin, plugin_config, tmp_path):
-        host_file = tmp_path / "src" / "api" / "app.py"
-        host_file.parent.mkdir(parents=True)
-        host_file.write_text("x = 1\n")
-        plugin_config.path_mapping = {"src/api": "/var/task"}
+    def test_detected_when_unset(self, make_plugin, plugin_config):
+        plugin_config.sink_bind = plugin_config.sink_host = None
+        plugin_config.docker_network = "sam-net"
         plugin = make_plugin()
-        plugin._write_shard(_data_file(tmp_path / "x", {"/var/task/app.py": [1]}))
-        (shard,) = tmp_path.glob(".coverage.container-*")
-        data = CoverageData(basename=str(shard))
-        data.read()
-        assert data.measured_files() == {str(host_file)}
+        plugin.backend.host_endpoint.return_value = ("172.17.0.1", "172.17.0.1")
+        assert plugin._sink_address() == ("172.17.0.1", "172.17.0.1")
+        plugin.backend.host_endpoint.assert_called_once_with("sam-net")
 
-    def test_combines_with_host_data_via_coverage_combine(self, make_plugin, tmp_path):
-        # What pytest-cov's finish does: combine() picks up <data_file>.* files.
+    def test_one_override_keeps_the_other_detected(self, make_plugin, plugin_config):
+        plugin_config.sink_bind = None
         plugin = make_plugin()
-        _data_file(tmp_path / ".coverage.host.1.abc", {"/host/mod.py": [1]})
-        plugin._write_shard(_data_file(tmp_path / "x", {"/var/task/app.py": [3]}))
-        cov = coverage.Coverage(data_file=str(tmp_path / ".coverage"))
-        cov.combine()
-        assert cov.get_data().measured_files() == {"/host/mod.py", "/var/task/app.py"}
+        plugin.backend.host_endpoint.return_value = ("172.17.0.1", "172.17.0.1")
+        assert plugin._sink_address() == ("172.17.0.1", "127.0.0.1")
 
-
-class TestExplicitCollect:
-    def test_collects_running_owned_containers_only(self, make_plugin, tmp_path):
+    def test_no_engine_falls_back_to_docker_desktop(self, make_plugin, plugin_config):
+        plugin_config.sink_bind = plugin_config.sink_host = None
         plugin = make_plugin()
-        plugin.find_owned = lambda **_: [_container("run"), _container("gone", status="exited")]
-        _stub_collect(plugin, {"run": [_data_file(tmp_path / "f1", {"/var/task/a.py": [1]})]})
-        assert plugin.collect_from_running() == 1
-        assert [c.args[1].id for c in plugin.driver.collect.call_args_list] == ["run"]
-        assert plugin.collected_ids == {"run"}
-
-    def test_required_raises_when_nothing_collected(self, make_plugin, plugin_config, monkeypatch):
-        monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw1")
-        plugin_config.worker_env = "MARK"
-        plugin = make_plugin(required=True)
-        plugin.find_owned = lambda **_: []
-        _stub_collect(plugin, {})
-        with pytest.raises(RuntimeError, match="MARK=gw1"):
-            plugin.collect_from_running()
-
-    def test_required_error_names_the_label_filter(self, make_plugin, plugin_config):
-        plugin_config.label = "sam.cli.container.type=lambda"
-        plugin = make_plugin(required=True)
-        plugin.find_owned = lambda **_: []
-        with pytest.raises(RuntimeError, match="labelled sam.cli.container.type=lambda"):
-            plugin.collect_from_running()
-
-    def test_not_required_returns_zero(self, make_plugin):
-        plugin = make_plugin()
-        plugin.find_owned = lambda **_: []
-        assert plugin.collect_from_running() == 0
-
-    def test_one_container_failure_does_not_block_the_rest(self, make_plugin, tmp_path):
-        plugin = make_plugin()
-        plugin.find_owned = lambda **_: [_container("a"), _container("b")]
-        good = _data_file(tmp_path / "good", {"/var/task/a.py": [1]})
-        plugin.driver = MagicMock()
-
-        def collect(backend, container, dest, cfg):
-            if container.id == "a":
-                raise RuntimeError("docker hiccup")
-            return [good]
-
-        plugin.driver.collect.side_effect = collect
-        with pytest.warns(UserWarning, match="collect failed for container sam-a"):
-            assert plugin.collect_from_running() == 1
-
-
-class TestCollectAtEnd:
-    def _session(self):
-        session = MagicMock()
-        session.testsfailed = 0
-        return session
-
-    def test_skips_containers_already_collected(self, make_plugin):
-        plugin = make_plugin()
-        plugin.collected_ids = {"a"}
-        plugin.explicit_calls = 1
-        plugin.find_owned = lambda **_: [_container("a", status="exited")]
-        _stub_collect(plugin, {})
-        plugin._collect_at_end(self._session())
-        plugin.driver.collect.assert_not_called()
-
-    def test_warns_when_nothing_found_and_no_explicit_call(self, make_plugin):
-        plugin = make_plugin()
-        plugin.find_owned = lambda **_: []
-        with pytest.warns(UserWarning, match="No matching containers"):
-            plugin._collect_at_end(self._session())
-
-    def test_silent_after_an_explicit_call(self, make_plugin, recwarn):
-        plugin = make_plugin()
-        plugin.explicit_calls = 1
-        plugin.find_owned = lambda **_: []
-        plugin._collect_at_end(self._session())
-        assert not [w for w in recwarn.list if "No matching" in str(w.message)]
-
-    def test_required_fails_the_session_when_containers_yield_nothing(self, make_plugin):
-        plugin = make_plugin(required=True)
-        plugin.find_owned = lambda **_: [_container("a", status="exited")]
-        _stub_collect(plugin, {})
-        session = self._session()
-        plugin._collect_at_end(session)
-        assert session.testsfailed == 1
-        assert "yielded no coverage data" in plugin.failure
-
-    def test_required_raises_in_an_xdist_worker(self, make_plugin):
-        # A worker's testsfailed never reaches the controller's exit code.
-        plugin = make_plugin(required=True, is_worker=True)
-        plugin.find_owned = lambda **_: [_container("a", status="exited")]
-        _stub_collect(plugin, {})
-        with pytest.raises(RuntimeError, match="yielded no coverage data"):
-            plugin._collect_at_end(self._session())
+        plugin.backend.host_endpoint.side_effect = docker.errors.DockerException("daemon down")
+        with pytest.warns(UserWarning, match="assuming Docker Desktop"):
+            assert plugin._sink_address() == ("127.0.0.1", "host.docker.internal")
 
 
 class TestContainerEnv:
-    def test_bootstrap_plus_worker_marker(self, make_plugin, plugin_config, monkeypatch):
+    def test_bootstrap_sink_and_marker(self, make_plugin, sam_project, monkeypatch):
         monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw0")
-        plugin_config.worker_env = "MARK"
-        plugin = make_plugin()
+        plugin = make_plugin(is_worker=True)
+        plugin.pytest_sessionstart(_session(sam_project))
+        assert plugin.sink is not None
         assert plugin.container_env() == {
             "COVERAGE_PROCESS_START": "/var/task/.coveragerc",
+            "COV_CONTAINER_SINK": plugin.sink.url,
             "MARK": "gw0",
         }
 
+    def test_marker_only_without_a_sink(self, make_plugin):
+        assert make_plugin().container_env() == {"MARK": "main"}
+
+
+class TestOnPush:
+    def test_maps_each_functions_paths_into_a_shard(self, make_plugin, sam_project, tmp_path):
+        plugin = make_plugin()
+        body = _data(
+            tmp_path / "in",
+            {"/var/task/handler.py": [1, 2], "/opt/python/shared/util.py": [1], "/var/lang/lib/x.py": [3]},
+        )
+        plugin._on_push("abc123def456-7", "Worker", body)
+        shard = sam_project / ".coverage.container-main-abc123def456-7"
+        assert plugin.shards == {"abc123def456-7": shard}
+        data = CoverageData(basename=str(shard))
+        data.read()
+        assert data.measured_files() == {
+            str(sam_project / "src/worker/handler.py"),
+            str(sam_project / "src/shared/python/shared/util.py"),
+            "/var/lang/lib/x.py",
+        }
+        assert not list(sam_project.glob(".cov-container-*.tmp"))
+
+    def test_a_later_push_of_the_same_process_replaces_it(self, make_plugin, sam_project, tmp_path):
+        plugin = make_plugin()
+        plugin._on_push("abc123def456-7", "Worker", _data(tmp_path / "a", {"/var/task/handler.py": [1]}))
+        plugin._on_push("abc123def456-7", "Worker", _data(tmp_path / "b", {"/var/task/handler.py": [1, 2]}))
+        (shard,) = sam_project.glob(".coverage.container-*")
+        data = CoverageData(basename=str(shard))
+        data.read()
+        assert data.lines(str(sam_project / "src/worker/handler.py")) == [1, 2]
+
+    def test_unknown_function_is_refused(self, make_plugin, tmp_path):
+        with pytest.raises(ValueError, match="unknown function 'Nope'"):
+            make_plugin()._on_push("abc123def456-7", "Nope", _data(tmp_path / "a", {"/var/task/x.py": [1]}))
+
+    def test_combines_with_host_data_via_coverage_combine(self, make_plugin, sam_project, tmp_path):
+        # What pytest-cov's finish does: combine() picks up <data_file>.* files.
+        _data(sam_project / ".coverage.host.1.abc", {"/host/mod.py": [1]})
+        make_plugin()._on_push("abc123def456-7", "ApiFunction", _data(tmp_path / "a", {"/var/task/app.py": [1]}))
+        cov = coverage.Coverage(data_file=str(sam_project / ".coverage"))
+        cov.combine()
+        assert cov.get_data().measured_files() == {"/host/mod.py", str(sam_project / "src/api/app.py")}
+
+
+class TestFlush:
+    def _plugin(self, make_plugin, sam_project, containers, *, pushes: bool, **kwargs):
+        plugin = make_plugin(is_worker=True, **kwargs)
+        plugin.pytest_sessionstart(_session(sam_project))
+        plugin.find_owned = lambda **_: containers
+
+        def send_signal(container_id):
+            if pushes:
+                plugin._on_push(f"{container_id[:12]}-1", "ApiFunction", _data(sam_project / "d", {"/var/task/app.py": [1]}))
+                plugin.sink._record(f"{container_id[:12]}-1")
+            return 1
+
+        plugin.backend.send_signal.side_effect = send_signal
+        return plugin
+
+    def test_signals_running_containers_and_waits_for_their_push(self, make_plugin, sam_project):
+        plugin = self._plugin(
+            make_plugin, sam_project, [_container(), _container("0000000000aa0000", status="exited")], pushes=True
+        )
+        assert plugin.collect_from_running() == 1
+        assert [c.args[0] for c in plugin.backend.send_signal.call_args_list] == ["abc123def4560000"]
+
+    def test_warns_when_a_signalled_container_never_pushes(self, make_plugin, sam_project, monkeypatch):
+        monkeypatch.setattr("pytest_cov_container.plugin._FLUSH_TIMEOUT_S", 0.2)
+        plugin = self._plugin(make_plugin, sam_project, [_container()], pushes=False)
+        with pytest.warns(UserWarning, match="did not push its coverage"):
+            assert plugin.collect_from_running() == 0
+
+    def test_required_raises_when_nothing_was_received(self, make_plugin, sam_project, monkeypatch):
+        monkeypatch.setattr("pytest_cov_container.plugin._FLUSH_TIMEOUT_S", 0.1)
+        plugin = self._plugin(make_plugin, sam_project, [], pushes=False, required=True)
+        with pytest.raises(RuntimeError, match=r"no coverage received .*labelled sam\.cli\.container\.type=lambda"):
+            plugin.collect_from_running()
+
+    def test_no_sink_no_flush(self, make_plugin):
+        assert make_plugin().collect_from_running() == 0
+
+
+class TestRunTestLoop:
+    @staticmethod
+    def _run_loop(plugin, session):
+        loop = plugin.pytest_runtestloop(session)
+        next(loop)
+        with pytest.raises(StopIteration):
+            loop.send(True)
+
+    def test_stops_the_sink_after_a_final_flush(self, make_plugin, sam_project):
+        plugin = make_plugin(is_worker=True)
+        plugin.pytest_sessionstart(_session(sam_project))
+        plugin.find_owned = MagicMock(return_value=[])
+        self._run_loop(plugin, _session(sam_project))
+        plugin.find_owned.assert_called_once()
+        with pytest.raises(urllib.error.URLError, match="refused"):
+            urllib.request.urlopen(plugin.sink.url, timeout=1)
+
+    def test_required_fails_a_plain_session_that_flushed_but_received_nothing(self, make_plugin, sam_project):
+        plugin = make_plugin(required=True)
+        plugin.pytest_sessionstart(_session(sam_project))
+        plugin.explicit_calls = 1
+        plugin.find_owned = MagicMock(return_value=[])
+        session = _session(sam_project)
+        self._run_loop(plugin, session)
+        assert session.testsfailed == 1
+        assert "no coverage received" in plugin.failure
+
+    def test_required_raises_in_an_xdist_worker(self, make_plugin, sam_project):
+        # A worker's testsfailed never reaches the controller's exit code.
+        plugin = make_plugin(required=True, is_worker=True)
+        plugin.pytest_sessionstart(_session(sam_project))
+        plugin.explicit_calls = 1
+        plugin.find_owned = MagicMock(return_value=[])
+        with pytest.raises(RuntimeError, match="no coverage received"):
+            self._run_loop(plugin, _session(sam_project))
+
+    def test_required_ignores_a_process_that_never_touched_containers(self, make_plugin, sam_project):
+        plugin = make_plugin(required=True, is_worker=True)
+        plugin.pytest_sessionstart(_session(sam_project))
+        plugin.find_owned = MagicMock(return_value=[])
+        self._run_loop(plugin, _session(sam_project))
+        assert plugin.failure is None
+
 
 class TestPytestSession:
-    """Real pytest + pytest-cov sessions with a fake docker backend."""
+    """Real pytest + pytest-cov sessions; a test plays the container and pushes."""
 
-    CONFTEST = """
-import pytest_cov_container.plugin as plugin_module
+    PUSH_TEST = """\
+import urllib.request
+from pathlib import Path
+
+import pytest_cov_container
 from coverage.data import CoverageData
-from pytest_cov_container.models import ContainerInfo
 
-EXTRACT = {extract!r}
-STATUS = {status!r}
+PUSH = {push!r}
+
+
+def test_container_pushes(tmp_path):
+    env = pytest_cov_container.container_env(Path.cwd())
+    if not PUSH:
+        return
+    data = CoverageData(basename=str(tmp_path / "d"))
+    data.add_lines({{"/var/task/container_app.py": [1, 2]}})
+    data.write()
+    request = urllib.request.Request(
+        env["COV_CONTAINER_SINK"],
+        data=(tmp_path / "d").read_bytes(),
+        method="POST",
+        headers={{"X-Cov-Id": "abc123def456-9", "X-Cov-Function": "Fn"}},
+    )
+    urllib.request.urlopen(request, timeout=5).close()
+"""
+
+    CONFTEST = """\
+import pytest
+import pytest_cov_container
+import pytest_cov_container.plugin as plugin_module
 
 
 class FakeBackend:
     def find_containers(self, image_pattern=None, label=None, predicate=None):
-        return [ContainerInfo(id="c1", name="fake", image="x", labels={{}}, status=STATUS)]
+        return []
 
     def send_signal(self, container_id):
         return 0
 
-    def extract_matching_files(self, container_id, source_dir, prefix, dest):
-        if not EXTRACT:
-            return []
-        path = dest / "c1-.coverage.container.h.1.a"
-        data = CoverageData(basename=str(path))
-        data.add_lines({{EXTRACT: [1, 2]}})
-        data.close()
-        return [path]
-
 
 plugin_module.DockerBackend = FakeBackend
+
+
+@pytest.fixture(autouse=True, scope="session")
+def server():
+    yield
+    pytest_cov_container.collect_container_coverage()
 """
 
-    def _project(self, pytester, *, extract: bool, host_import: bool = True, explicit: bool = False):
+    def _project(self, pytester, *, push: bool):
         pytester.makefile(
             ".toml",
-            pyproject="""
-[tool.pytest-cov-container]
-image_pattern = "x*"
-
-[tool.pytest-cov-container.python]
-build_dir = "build"
-wrapper = false
-""",
+            pyproject=(
+                '[tool.pytest-cov-container]\nframework = "aws-sam"\n'
+                'sink_host = "127.0.0.1"\nsink_bind = "127.0.0.1"\n'
+            ),
         )
-        (pytester.path / "build").mkdir()
-        src = pytester.path / "src"
-        src.mkdir()
+        pytester.makefile(
+            ".yaml",
+            template=(
+                "Resources:\n  Fn:\n    Type: AWS::Serverless::Function\n    Properties:\n"
+                "      CodeUri: src/fn/\n      Runtime: python3.14\n      Handler: app.handler\n"
+            ),
+        )
+        (pytester.path / ".aws-sam" / "build" / "Fn").mkdir(parents=True)
+        src = pytester.path / "src" / "fn"
+        src.mkdir(parents=True)
         (src / "container_app.py").write_text("def f():\n    return 1\n")
-        (src / "host_mod.py").write_text("X = 1\n")
-        target = str(src / "container_app.py") if extract else ""
-        status = "running" if explicit else "exited"
-        pytester.makeconftest(self.CONFTEST.format(extract=target, status=status))
-        if explicit:
-            # Collected in a fixture teardown, as a sam-local fixture does: inside
-            # pytest's per-test catch_warnings, which undoes any filter set there.
-            pytester.makepyfile(
-                test_x="import pytest\nimport pytest_cov_container\n\n"
-                "@pytest.fixture\ndef app():\n    yield\n"
-                "    assert pytest_cov_container.collect_container_coverage() == 1\n\n"
-                "def test_x(app):\n    pass\n"
-            )
-            return
-        if not host_import:
-            # The tests only drive the container: the host measures nothing.
-            pytester.makepyfile(test_x="def test_x():\n    pass\n")
-            return
-        pytester.makepyfile(
-            test_x="import sys\nsys.path.insert(0, 'src')\n\ndef test_x():\n    import host_mod\n    assert host_mod.X == 1\n"
-        )
+        pytester.makeconftest(self.CONFTEST)
+        pytester.makepyfile(test_push=self.PUSH_TEST.format(push=push))
 
-    def test_container_data_lands_in_pytest_covs_report(self, pytester):
-        self._project(pytester, extract=True)
+    def test_pushed_data_lands_in_pytest_covs_report(self, pytester):
+        self._project(pytester, push=True)
         result = pytester.runpytest_subprocess("--cov=src", "--cov-report=term-missing")
         assert result.ret == 0
         result.stdout.re_match_lines([r".*container_app\.py\s+2\s+0\s+100%"])
-
-    @pytest.mark.parametrize("explicit", [False, True], ids=["at-end", "fixture-teardown"])
-    def test_container_data_silences_the_hosts_no_data_warning(self, pytester, explicit):
-        # coverage checks only the host's own (empty) data at save time; the
-        # container's data is the coverage this run exists for.
-        self._project(pytester, extract=True, host_import=False, explicit=explicit)
-        result = pytester.runpytest_subprocess("--cov=src", "--cov-report=term-missing")
-        assert result.ret == 0
-        result.stdout.re_match_lines([r".*container_app\.py\s+2\s+0\s+100%"])
+        # The host measured nothing itself; the pushed data is the coverage.
         assert "No data was collected" not in result.stdout.str() + result.stderr.str()
+        assert (pytester.path / ".aws-sam/build/Fn" / protocol.PTH_FILE).is_file()
 
-    def test_no_data_warning_stays_when_containers_yield_nothing(self, pytester):
-        self._project(pytester, extract=False, host_import=False)
-        result = pytester.runpytest_subprocess("--cov=src", "--cov-report=term-missing")
-        assert "No data was collected" in result.stdout.str() + result.stderr.str()
-
-    def test_required_fails_the_run_when_no_data(self, pytester):
-        self._project(pytester, extract=False)
+    def test_required_fails_the_run_when_nothing_arrives(self, pytester):
+        self._project(pytester, push=False)
         result = pytester.runpytest_subprocess("--cov=src", "--cov-container-required")
-        assert result.ret == 1
-        result.stdout.fnmatch_lines(["*yielded no coverage data*"])
+        assert result.ret != 0
+        result.stdout.fnmatch_lines(["*no coverage received*"])
 
     def test_inactive_without_cov(self, pytester):
-        self._project(pytester, extract=True)
+        self._project(pytester, push=False)
         result = pytester.runpytest_subprocess()
         assert result.ret == 0
-        assert not (pytester.path / "build" / ".coveragerc").exists()
+        assert not (pytester.path / ".aws-sam/build/Fn" / protocol.PTH_FILE).exists()
 
 
 class TestPytestConfigure:
@@ -337,84 +360,3 @@ class TestPytestConfigure:
         result = pytester.runpytest("--help")
         result.stdout.fnmatch_lines(["*--no-cov-container*"])
 
-
-class TestEndToEndDefaultPath:
-    """Exercise the full move-and-shim chain: inject() then `bash run.sh`.
-
-    Validates that the rendered wrapper runs the user's _orig_run.sh, that
-    coverage data is written, and that exit code propagates from the child.
-    No Docker dependency.
-    """
-
-    def test_end_to_end_default_path_writes_coverage(self, tmp_path):
-        build = tmp_path / "build"
-        build.mkdir()
-
-        # User's tiny app
-        app = build / "app.py"
-        app.write_text(
-            "def main():\n    return 1 + 2\n\nif __name__ == '__main__':\n    main()\n"
-        )
-
-        # User's run.sh exec's their app. Quote paths — sys.executable may
-        # contain spaces (e.g. hatch venvs under "Application Support").
-        run_sh = build / "run.sh"
-        run_sh.write_text(f'#!/bin/bash\nexec "{sys.executable}" "{app}"\n')
-        run_sh.chmod(0o755)
-
-        # site-packages with a `.pth` calling coverage.process_startup() —
-        # the gate inject() enforces, AND the mechanism subprocess attach uses.
-        sp = build / "site-packages"
-        sp.mkdir()
-        (sp / "coverage_subprocess.pth").write_text(
-            "import coverage; coverage.process_startup()\n"
-        )
-
-        driver = PythonDriver()
-        result = driver.inject(
-            build,
-            DriverConfig(build_dir=str(build), entrypoint=None, path_mapping={}),
-        )
-        assert len(result.files_written) == 4
-
-        # Wrapper artifacts now self-locate via dirname($0); no /var/task
-        # substitution needed. Just redirect the hardcoded /tmp data_file
-        # so the test doesn't pollute /tmp under xdist.
-        rc = build / ".coveragerc"
-        rc.write_text(
-            rc.read_text().replace(
-                "/tmp/.coverage.container", str(build / ".coverage.container")
-            )
-        )
-        # Re-set executable bit (write_text may have preserved it, but be safe)
-        run_sh.chmod(run_sh.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-
-        # Execute the shim. coverage data file inside build_dir for isolation.
-        # Inherit parent env (so `python` resolves to the venv interpreter w/
-        # coverage installed) plus point COVERAGE_PROCESS_START at our rc and
-        # PYTHONPATH at the site-packages whose .pth attaches subprocess cov.
-        import os
-
-        env = {
-            **os.environ,
-            "COVERAGE_PROCESS_START": str(build / ".coveragerc"),
-            "PYTHONPATH": str(sp),
-        }
-        proc = subprocess.run(  # noqa: S603
-            ["bash", str(run_sh)],
-            env=env,
-            capture_output=True,
-            timeout=10,
-        )
-        assert proc.returncode == 0, (
-            f"wrapper exit nonzero: rc={proc.returncode}\n"
-            f"stdout={proc.stdout.decode()}\nstderr={proc.stderr.decode()}"
-        )
-
-        # At least one .coverage.container* file written
-        cov_files = list(build.glob(".coverage.container*"))
-        assert cov_files, (
-            f"no coverage data files in {build}; ls: {list(build.iterdir())}"
-        )
-        # Non-trivial size
-        assert any(f.stat().st_size > 0 for f in cov_files)

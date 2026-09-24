@@ -29,13 +29,11 @@ dependencies = [
   "pytest-cov>=7.1.0",
   "docker>=7.2.0",
   "coverage>=7.16.1",
+  "pyyaml>=6.0.3",
 ]
 
 [project.entry-points.pytest11]
 cov_container = "pytest_cov_container.plugin"
-
-[project.entry-points."pytest_cov_container.drivers"]
-python = "pytest_cov_container.drivers.python:PythonDriver"
 
 [project.urls]
 Documentation = "https://github.com/tomaDev/pytest-cov-container#readme"

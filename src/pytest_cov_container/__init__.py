@@ -5,20 +5,21 @@
 
 User-facing helpers:
 
-* :func:`collect_container_coverage` — save and collect the running containers
-  this process owns; call it before stopping them.
 * :func:`container_env` — the env vars a container needs: the coverage
-  bootstrap (only while the plugin is active) plus the worker ownership marker.
+  bootstrap and this process's sink (only while the plugin is active) plus the
+  worker ownership marker.
+* :func:`collect_container_coverage` — ask the running containers this process
+  owns to push their coverage; call it before stopping a long-running server's
+  containers (per-invocation handlers push by themselves).
 * :func:`owned_containers` — the containers this checkout (and worker) owns,
   e.g. for a reaper that removes leaked containers without touching a
   concurrent session's.
-* :func:`worker_id`, :data:`PID_FILE`, :data:`DONE_FILE` — the pieces an
-  application needs to run the save protocol itself (``wrapper = false``).
+* :func:`worker_id` — this process's xdist worker id (``main`` without xdist).
 
 The active ``ContainerCovPlugin`` is a process-local singleton
 (``_active_plugin``) populated at ``pytest_configure`` time via
 :func:`_register_active_plugin`. pytest-xdist workers are separate processes,
-so each worker has its own plugin and its own owned containers.
+so each worker has its own plugin, sink and owned containers.
 """
 
 import warnings
@@ -27,15 +28,12 @@ from typing import TYPE_CHECKING
 
 from pytest_cov_container import config as _config
 from pytest_cov_container.ownership import worker_id
-from pytest_cov_container.protocol import DONE_FILE, PID_FILE
 
 if TYPE_CHECKING:
     from pytest_cov_container.models import ContainerInfo
     from pytest_cov_container.plugin import ContainerCovPlugin
 
 __all__ = [
-    "DONE_FILE",
-    "PID_FILE",
     "collect_container_coverage",
     "container_env",
     "owned_containers",
@@ -54,11 +52,11 @@ def _register_active_plugin(plugin: "ContainerCovPlugin | None") -> None:
 
 
 def collect_container_coverage() -> int:
-    """Save and collect coverage from the running containers this process owns.
+    """Ask the running containers this process owns to push their coverage now.
 
-    Call this before stopping the containers. Returns the number of data files
-    collected (0 when the plugin is inactive). With ``required``, collecting
-    nothing raises ``RuntimeError``.
+    Call this before stopping the containers of a long-running server. Returns
+    the number of containers that pushed (0 when the plugin is inactive). With
+    ``required``, a process that received no data at all raises ``RuntimeError``.
 
     Example::
 
@@ -93,13 +91,12 @@ def container_env(rootpath: Path) -> dict[str, str]:
 
     Always the worker marker (``<worker_env>=<worker_id()>``) when
     ``worker_env`` is configured, so ownership works even with coverage off;
-    plus the coverage bootstrap (``COVERAGE_PROCESS_START`` for Python) only
-    while the plugin is active — without the injected rcfile it would point at
-    nothing.
+    plus ``COVERAGE_PROCESS_START`` and ``COV_CONTAINER_SINK`` only while the
+    plugin is active in a process that runs tests.
 
     ``sam local --env-vars`` only overrides variables the template already
-    declares: declare each of these (empty) in ``template.yaml``, or sam drops
-    them silently.
+    declares: declare each of these (empty) in ``template.yaml`` Globals, or sam
+    drops them silently. Empty, the injected bootstrap stays inert.
     """
     if _active_plugin is not None:
         return _active_plugin.container_env()

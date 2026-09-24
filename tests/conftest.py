@@ -1,28 +1,87 @@
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
 pytest_plugins = ["pytester"]
 
+# Short-form intrinsics on purpose: the preset must read past them.
+SAM_TEMPLATE = """\
+Globals:
+  Function:
+    Runtime: python3.14
+    Layers:
+      - !Ref SharedLayer
+Resources:
+  SharedLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      ContentUri: src/shared/
+  ExtraLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      ContentUri: src/extra/
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/api/
+      Handler: run.sh
+      Role: !GetAtt Role.Arn
+      Environment:
+        Variables:
+          TABLE: !Ref Table
+          URL: !Sub "https://${Api}.example.com"
+  Worker:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/worker
+      Handler: handler.handler
+      Layers:
+        - !Ref ExtraLayer
+        - arn:aws:lambda:us-east-1:123456789012:layer:vendor:1
+  NodeFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/node
+      Runtime: nodejs22.x
+      Handler: index.handler
+  ImageFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      PackageType: Image
+  S3Fn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri:
+        Bucket: artifacts
+        Key: fn.zip
+      Handler: app.handler
+  Queue:
+    Type: AWS::SQS::Queue
+"""
+
+SAM_SOURCES = {
+    "src/api/app.py": "def f():\n    return 1\n",
+    "src/api/tests/test_app.py": "",
+    "src/shared/python/shared/util.py": "X = 1\n",
+    "src/extra/python/extra.py": "Y = 2\n",
+    "src/worker/handler.py": "def handler(event, context):\n    return event\n",
+    "src/worker/.hidden/skip.py": "",
+}
+
 
 @pytest.fixture
-def sample_pyproject(tmp_path):
-    """Write a minimal pyproject.toml with plugin config and return its path."""
-    content = """\
-[tool.pytest-cov-container]
-image_pattern = "samcli/lambda*"
-label = "pytest-cov-container"
-
-[tool.pytest-cov-container.path_mapping]
-"src/api" = "/var/task"
-
-[tool.pytest-cov-container.python]
-build_dir = ".aws-sam/build/ApiFunction"
-entrypoint = "uvicorn app:app --host 0.0.0.0 --port 8080"
-"""
-    pyproject = tmp_path / "pyproject.toml"
-    pyproject.write_text(content)
-    return pyproject
+def sam_project(tmp_path) -> Path:
+    """A SAM project root: template, sources, built function dirs and a pyproject."""
+    (tmp_path / "template.yaml").write_text(SAM_TEMPLATE)
+    for rel, text in SAM_SOURCES.items():
+        path = tmp_path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    for function in ("ApiFunction", "Worker"):
+        (tmp_path / ".aws-sam" / "build" / function).mkdir(parents=True)
+    (tmp_path / "pyproject.toml").write_text('[tool.pytest-cov-container]\nframework = "aws-sam"\n')
+    return tmp_path
 
 
 @pytest.fixture

@@ -1,10 +1,7 @@
-import io
 import re
-import tarfile
-import time
+import sys
 import warnings
 from collections.abc import Callable, Mapping
-from pathlib import Path
 from typing import Any
 
 import docker
@@ -15,54 +12,17 @@ from pytest_cov_container.models import ContainerInfo
 
 _SIGNALLED_RE = re.compile(rb"signalled=(\d+)")
 
-# SQLite side files that can sit next to a data file mid-write; never combine them.
-_SQLITE_SIDE_SUFFIXES = ("-journal", "-wal", "-shm")
+# Engines that forward host.docker.internal to the host's loopback.
+_DESKTOP_ENGINES = ("Docker Desktop", "OrbStack")
+_DESKTOP_ENDPOINT = ("127.0.0.1", "host.docker.internal")
 
-# PEP 706 data filter — present on 3.12+, polyfilled below for 3.11.
-_tarfile_data_filter = getattr(tarfile, "data_filter", None)
-
-
-def _is_safe_data_member(member: tarfile.TarInfo, dest: Path) -> bool:
-    """Reject tar members that would escape `dest` or are not plain files.
-
-    PEP 706 ``data`` filter on 3.12+; hand-rolled equivalent on 3.11. The
-    code path here doesn't use ``extractall`` (it writes each file's
-    basename to ``dest`` directly) so the data filter is defense-in-depth,
-    not the sole barrier. The two practical hazards we block:
-
-    1. Members whose name escapes the destination (`..` segments,
-       absolute paths). The basename-rewrite in the caller already
-       neutralises the escape on the host, but rejecting at filter time
-       documents the intent and forward-protects any future caller that
-       relaxes the basename trick (e.g. supporting nested directories).
-    2. Non-regular members (symlinks, hardlinks, devices, fifos).
-       ``isfile()`` already catches these; the filter call documents it.
-    """
-    if _tarfile_data_filter is not None:
-        try:
-            _tarfile_data_filter(member, str(dest))
-        except (tarfile.FilterError, OSError):
-            return False
-        return member.isfile()
-    # 3.11 polyfill: hand-check.
-    if not member.isfile():
-        return False
-    name = member.name
-    if name.startswith("/") or ".." in Path(name).parts:
-        return False
-    return True
-
-
-# Clears the previous sentinel first, so a second collection never mistakes the
-# first save's sentinel for its own. No pid file means no coverage process.
+# No pid file means no coverage process in the container.
 _SIGNAL_CMD = [
     "sh",
     "-c",
-    f"rm -f {protocol.DONE_FILE}; "
     f'pid=$(cat {protocol.PID_FILE} 2>/dev/null) || {{ echo "signalled=0"; exit 0; }}; '
     'kill -USR1 "$pid" && echo "signalled=1" || echo "signalled=0"',
 ]
-_DONE_CMD = ["test", "-f", protocol.DONE_FILE]
 
 
 class DockerBackend:
@@ -99,9 +59,7 @@ class DockerBackend:
         # ignore_removed: list() inspects each container after listing them, and
         # a container removed in between (a sibling xdist worker's teardown, an
         # auto-removed one-shot run) would otherwise raise NotFound.
-        containers = self._client.containers.list(
-            all=True, filters=filters, ignore_removed=True
-        )
+        containers = self._client.containers.list(all=True, filters=filters, ignore_removed=True)
 
         patterns = [image_pattern] if isinstance(image_pattern, str) else image_pattern
         if patterns:
@@ -116,8 +74,33 @@ class DockerBackend:
 
         return [self._to_info(c) for c in containers]
 
+    def host_endpoint(self, network: str | None = None, *, platform: str = sys.platform) -> tuple[str, str]:
+        """``(bind, advertise)`` for a host service the containers must reach.
+
+        Docker Desktop (and OrbStack) forward ``host.docker.internal`` to the
+        host's loopback, so a loopback bind is reachable and stays private; the
+        same holds for any VM-based engine on a macOS or Windows host. A Linux
+        engine routes containers to the host through the network's gateway
+        (``docker0``, typically ``172.17.0.1``): bind and advertise that IP, so
+        no ``--add-host`` is needed and nothing outside Docker can connect.
+        ``network`` is the one the containers join (default: ``bridge``).
+        """
+        info = self._client.info()
+        engine = str(info.get("OperatingSystem") or "")
+        if any(name in engine for name in _DESKTOP_ENGINES) or not platform.startswith("linux"):
+            return _DESKTOP_ENDPOINT
+        ipam = (self._client.networks.get(network or "bridge").attrs.get("IPAM") or {}).get("Config") or []
+        gateway = next((entry.get("Gateway") for entry in ipam if entry.get("Gateway")), None)
+        if not gateway:
+            msg = (
+                f"docker network {network or 'bridge'!r} has no gateway to reach the host through; "
+                "set sink_bind and sink_host in [tool.pytest-cov-container]"
+            )
+            raise RuntimeError(msg)
+        return gateway, gateway
+
     def send_signal(self, container_id: str) -> int:
-        """Send SIGUSR1 to the coverage process named by the pid file.
+        """Send SIGUSR1 (push your coverage) to the process named by the pid file.
 
         Returns 1 when signalled, 0 when the container has no coverage process
         (no pid file, or the pid is gone), -1 on a docker API error.
@@ -134,70 +117,6 @@ class DockerBackend:
             return -1
         match = _SIGNALLED_RE.search(output or b"")
         return int(match.group(1)) if match else 0
-
-    def wait_for_done(
-        self,
-        container_id: str,
-        timeout: float = 10.0,
-        interval: float = 0.1,
-    ) -> bool:
-        """Poll for the save sentinel (``protocol.DONE_FILE``).
-
-        True once it exists; False on timeout or docker error. A real save
-        takes 1-20 ms; the timeout is headroom for a CPU-starved host.
-        """
-        try:
-            container = self._client.containers.get(container_id)
-        except docker.errors.APIError:
-            return False
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            try:
-                exit_code, _ = container.exec_run(_DONE_CMD)
-            except docker.errors.APIError:
-                return False
-            if exit_code == 0:
-                return True
-            time.sleep(interval)
-        return False
-
-    def extract_matching_files(
-        self,
-        container_id: str,
-        source_dir: str,
-        prefix: str,
-        dest: Path,
-    ) -> list[Path]:
-        try:
-            container = self._client.containers.get(container_id)
-            stream, _ = container.get_archive(source_dir)
-        except docker.errors.APIError as exc:
-            warnings.warn(
-                f"Failed to extract from container {container_id[:12]}: {exc}. Check that the container is accessible.",
-                UserWarning,
-                stacklevel=2,
-            )
-            return []
-
-        tar_bytes = b"".join(stream)
-        extracted: list[Path] = []
-        with tarfile.open(fileobj=io.BytesIO(tar_bytes)) as tar:
-            for member in tar.getmembers():
-                if not _is_safe_data_member(member, dest):
-                    continue
-                name = Path(member.name).name
-                if not name.startswith(prefix) or name.endswith(_SQLITE_SIDE_SUFFIXES):
-                    continue
-                member_file = tar.extractfile(member)
-                if member_file:
-                    target = dest / f"{container_id[:12]}-{name}"
-                    target.write_bytes(member_file.read())
-                    extracted.append(target)
-        return extracted
-
-    def inspect(self, container_id: str) -> dict:
-        container = self._client.containers.get(container_id)
-        return container.attrs
 
     @staticmethod
     def _config_image(container) -> str:
