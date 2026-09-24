@@ -1,4 +1,4 @@
 # SPDX-FileCopyrightText: 2026-present tomaDev <genins21@gmail.com>
 #
 # SPDX-License-Identifier: MIT
-__version__ = "0.4.1"
+__version__ = "0.5.0"
