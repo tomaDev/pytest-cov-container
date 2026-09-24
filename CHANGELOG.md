@@ -87,6 +87,10 @@ hand-rolled all of this in its test fixtures.
   `wait_for_done`. `LanguageDriver.inject` takes `rootpath` and `branch`
   keywords, `collect` returns the extracted files, and drivers implement
   `container_env(config)`.
+- `scripts/release.py` bumps the minor version when called with no argument
+  (was: release the current `__about__.py` version as-is). `--dry-run` now
+  predicts `major`/`minor`/`patch` bumps, so it checks the new tag instead of
+  the current one.
 
 ## 0.3.0 — 2026-05-15
 

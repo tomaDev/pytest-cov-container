@@ -199,13 +199,12 @@ hatch run types:check
 # Security scan
 hatch run security:scan
 
-# Cut a release. Pass a version literal or a hatch segment (`patch`,
-# `minor`, `major`, `rc`, etc.) to bump + tag + push in one shot.
-# Omit the arg to release whatever __about__.py currently has.
+# Cut a release: bump + commit + tag + push in one shot. Pass a version
+# literal or a hatch segment (`patch`, `minor`, `major`, `rc`, etc.).
+# Omit the arg to bump the minor version.
+hatch run release           # 0.2.0 → 0.3.0
 hatch run release patch     # 0.2.0 → 0.2.1
-hatch run release minor     # 0.2.0 → 0.3.0
 hatch run release 0.3.5     # explicit
-hatch run release           # use current version
 ```
 
 ## License

@@ -5,14 +5,14 @@ Usage:
     python scripts/release.py [VERSION_OR_SEGMENT] [--dry-run]
 
 Examples:
-    hatch run release                     # release current __about__.py version
+    hatch run release                     # 0.2.0 → 0.3.0 (default: minor)
     hatch run release patch               # 0.2.0 → 0.2.1
     hatch run release minor               # 0.2.0 → 0.3.0
     hatch run release major               # 0.2.0 → 1.0.0
     hatch run release 0.3.5               # explicit version
     hatch run release patch --dry-run     # show plan, mutate nothing
 
-If an argument is given, it is passed straight to `hatch version`, which
+The argument (default `minor`) is passed straight to `hatch version`, which
 accepts either a literal version or a segment keyword (`patch`, `minor`,
 `major`, `rc`, `b`, `a`, `post`, `dev`, etc.). The resolved version is
 then read back and used for the release commit + tag.
@@ -21,7 +21,7 @@ Workflow:
     1. Verify clean working tree on main (BEFORE any mutation).
     2. `git fetch origin main`, then fast-forward local main if behind.
        Refuses if origin/main has diverged.
-    3. If an argument is given: bump __about__.py, commit "release X.Y.Z".
+    3. Bump __about__.py, commit "release X.Y.Z".
     4. Verify the resolved tag does not already exist locally or on origin.
     5. Push main.
     6. Create and push the tag.
@@ -44,6 +44,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 ABOUT = ROOT / "src" / "pytest_cov_container" / "__about__.py"
+LITERAL_VERSION = r"\d+\.\d+\.\d+([.+-].*)?"
+SEGMENTS = ("major", "minor", "patch")
 
 
 def _run(*args: str, capture: bool = False) -> str:
@@ -66,25 +68,38 @@ def _read_version() -> str:
     return match.group(1)
 
 
-def _bump_and_commit(spec: str, *, dry_run: bool) -> str:
+def _preview_version(spec: str, current: str) -> str | None:
+    """Predict what `hatch version <spec>` resolves to, without running it.
+    Handles literals and the major/minor/patch segments of an X.Y.Z version;
+    returns None for anything else (rc, dev, ...)."""
+    if re.fullmatch(LITERAL_VERSION, spec):
+        return spec
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", current)
+    if spec not in SEGMENTS or match is None:
+        return None
+    parts = [int(part) for part in match.groups()]
+    index = SEGMENTS.index(spec)
+    parts[index] += 1
+    parts[index + 1 :] = [0] * (len(parts) - index - 1)
+    return ".".join(map(str, parts))
+
+
+def _bump_and_commit(spec: str, *, dry_run: bool) -> str | None:
     """Pass `spec` to `hatch version`, then read the resolved version back
     and commit if it changed. Returns the resolved version (or current, on
     no-op).
 
-    Under --dry-run: ask `hatch version` what the segment would resolve to
-    via `hatch version --dry-run`, but never write the file or commit."""
+    Under --dry-run: predict the resolved version via `_preview_version`,
+    never write the file or commit. Returns None if it cannot be predicted."""
     current = _read_version()
     if dry_run:
-        # `hatch version <spec>` mutates by default; preview-only flag varies
-        # by hatch version. Fall back to printing intent and assuming the
-        # spec is the resolved version when it looks like a literal.
-        if re.fullmatch(r"\d+\.\d+\.\d+([.+-].*)?", spec):
-            new = spec
-        else:
-            new = f"<resolved by `hatch version {spec}` at run time>"
-        print(f"[dry-run] hatch version {spec}  (would bump {current} → {new})")
+        # `hatch version <spec>` always writes __about__.py; it has no
+        # preview flag.
+        new = _preview_version(spec, current)
+        shown = new or f"<resolved by `hatch version {spec}` at run time>"
+        print(f"[dry-run] hatch version {spec}  (would bump {current} → {shown})")
         print(f"[dry-run] git add {ABOUT.relative_to(ROOT)}")
-        print(f"[dry-run] git commit -m 'release {new}'")
+        print(f"[dry-run] git commit -m 'release {shown}'")
         return new
 
     _run("hatch", "version", spec)
@@ -106,7 +121,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "version",
         nargs="?",
-        help="Literal version (0.3.5) or hatch segment (patch/minor/major/rc/...).",
+        default="minor",
+        help="Literal version (0.3.5) or hatch segment (patch/minor/major/rc/...). "
+        "Default: minor.",
     )
     parser.add_argument(
         "--dry-run",
@@ -150,19 +167,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"fast-forwarding {behind} commit(s) from origin/main")
         _mutate("git", "merge", "--ff-only", "origin/main", dry_run=dry_run)
 
-    if args.version is not None:
-        _bump_and_commit(args.version, dry_run=dry_run)
-
-    # In dry-run with a literal new version (e.g. 0.3.5 or a resolved literal
-    # from a segment), check that intended version against the tag space.
-    # Otherwise fall back to the current __about__.py (no-arg case or
-    # unresolved segment under dry-run).
-    if dry_run and args.version is not None and re.fullmatch(
-        r"\d+\.\d+\.\d+([.+-].*)?", args.version
-    ):
-        version = args.version
-    else:
-        version = _read_version()
+    # Under dry-run, check the predicted version against the tag space; fall
+    # back to the current __about__.py when it cannot be predicted (rc, dev).
+    version = _bump_and_commit(args.version, dry_run=dry_run) or _read_version()
 
     local_tag = _run("git", "tag", "--list", version, capture=True)
     if local_tag:
