@@ -1,3 +1,4 @@
+import dataclasses
 import threading
 import urllib.error
 import urllib.request
@@ -135,6 +136,16 @@ class TestContainerEnv:
 
     def test_marker_only_without_a_sink(self, make_plugin):
         assert make_plugin().container_env() == {"MARK": "main"}
+
+    def test_targets_with_different_container_roots_are_refused(self, plugin_config, sam_project):
+        # RCFILE_ENV is one value for every container this process starts.
+        odd = dataclasses.replace(plugin_config.targets[0], name="Odd", container_root="/opt/app")
+        cfg = dataclasses.replace(plugin_config, targets=(*plugin_config.targets, odd))
+        with (
+            patch("pytest_cov_container.plugin.DockerBackend"),
+            pytest.raises(ValueError, match=r"different container_root values: \['/opt/app', '/var/task'\]"),
+        ):
+            ContainerCovPlugin(cfg, sam_project)
 
 
 class TestOnPush:
