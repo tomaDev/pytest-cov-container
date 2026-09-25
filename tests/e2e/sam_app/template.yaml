@@ -48,6 +48,16 @@ Resources:
             Path: /sync
             Method: get
 
+  # Built by uv (beta in SAM CLI: `sam build --beta-features`).
+  UvFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/uv/
+      Handler: app.handler
+      Runtime: python3.14
+    Metadata:
+      BuildMethod: python-uv
+
   # Not measured: the preset skips non-Python runtimes, and a flush must pass
   # over its container quietly.
   NodeFunction:

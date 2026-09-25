@@ -11,6 +11,7 @@ pytestmark = pytest.mark.e2e
 SYNC = "src/sync/app.py"
 LAYER = "src/layers/shared/shared/util.py"
 MADE_LAYER = "src/layers/made/src/made/greet.py"
+UV = "src/uv/app.py"
 _RUN_TIMEOUT_S = 900
 
 
@@ -52,6 +53,10 @@ def test_invoke_pushes_after_each_call(app):
     assert {8, 9, 10, 12, 13} <= lines[SYNC]
     assert {2} <= lines[LAYER]  # layer code, built into /opt/python
     assert {2} <= lines[MADE_LAYER]  # built by a Makefile that moves src/ to python/
+    # uv's build leaves its lock file next to the code.
+    assert (app / ".aws-sam/build/UvFunction/uv.lock").is_file()
+    assert {5, 6} <= lines[UV]
+    assert 7 not in lines[UV]
 
 
 def test_flush_of_warm_start_api_containers(app):

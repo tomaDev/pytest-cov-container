@@ -37,7 +37,7 @@ For `framework = "aws-sam"` the preset reads `template.yaml`:
 
 | What | Inferred as |
 |-----|-------------|
-| functions | every zip Python function with a local `CodeUri` (or the `functions` list) |
+| functions | every zip Python function with a local `CodeUri`, whatever builds it (pip, `python-uv`, `makefile`), or the `functions` list |
 | build dir | from `sam build`'s own template (`.aws-sam/build/<dir>`; functions that share code share one), else `.aws-sam/build/<logical id>` |
 | sources | the function's `CodeUri` at `/var/task`, and each local layer's `ContentUri` where `sam build` put its files under `/opt`, whatever built it (`python3.x`, `makefile`, none); before a build, by its `BuildMethod` (Globals and function `Layers`) |
 | `label` | `sam.cli.container.type=lambda` (set by SAM CLI 1.165+ on every Lambda container) |

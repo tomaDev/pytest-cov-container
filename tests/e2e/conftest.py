@@ -34,8 +34,14 @@ def built_app(tmp_path_factory) -> Path:
         pytest.skip("SAM CLI not installed")
     root = tmp_path_factory.mktemp("sam_app")
     shutil.copytree(APP, root, dirs_exist_ok=True, ignore=shutil.ignore_patterns(".aws-sam", "__pycache__"))
+    # --beta-features: the `python-uv` build method is beta in SAM CLI.
     build = subprocess.run(
-        ["sam", "build"], cwd=root, capture_output=True, text=True, timeout=_BUILD_TIMEOUT_S, check=False
+        ["sam", "build", "--beta-features"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=_BUILD_TIMEOUT_S,
+        check=False,
     )
     assert build.returncode == 0, build.stdout + build.stderr
     return root

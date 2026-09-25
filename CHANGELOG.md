@@ -22,7 +22,7 @@
 
 - **E2E suite** (`tests/e2e/`): a small SAM project run with `--cov` against
   real `sam local` containers: `invoke` pushes (handler lines, a pip-built
-  and a Makefile-built layer),
+  and a Makefile-built layer, a function built by uv),
   `start-api` flushed over `SIGUSR1` next to a Node function, and xdist
   workers. Marked `e2e`, off by default; `hatch test -m e2e -n 0`.
 
