@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Internal
+
+- `hatch run release` with no argument bumps the patch version, not the
+  minor one (`scripts/release.py`, README).
+
+## 0.6.0 — 2026-09-25
+
 ### Fixed
 
 - **Layers are measured where `sam build` put them.** The preset mapped every

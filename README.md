@@ -162,9 +162,9 @@ hatch run security:scan
 
 # Cut a release: test every Python and run the e2e suite, then bump + commit + tag + push in one shot. Pass a version
 # literal or a hatch segment (`patch`, `minor`, `major`, `rc`, etc.).
-# Omit the arg to bump the minor version.
-hatch run release           # 0.2.0 → 0.3.0
-hatch run release patch     # 0.2.0 → 0.2.1
+# Omit the arg to bump the patch version.
+hatch run release           # 0.2.0 → 0.2.1
+hatch run release minor     # 0.2.0 → 0.3.0
 hatch run release 0.3.5     # explicit
 ```
 

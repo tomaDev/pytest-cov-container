@@ -5,14 +5,14 @@ Usage:
     python scripts/release.py [VERSION_OR_SEGMENT] [--dry-run]
 
 Examples:
-    hatch run release                     # 0.2.0 → 0.3.0 (default: minor)
+    hatch run release                     # 0.2.0 → 0.2.1 (default: patch)
     hatch run release patch               # 0.2.0 → 0.2.1
     hatch run release minor               # 0.2.0 → 0.3.0
     hatch run release major               # 0.2.0 → 1.0.0
     hatch run release 0.3.5               # explicit version
     hatch run release patch --dry-run     # show plan, mutate nothing
 
-The argument (default `minor`) is passed straight to `hatch version`, which
+The argument (default `patch`) is passed straight to `hatch version`, which
 accepts either a literal version or a segment keyword (`patch`, `minor`,
 `major`, `rc`, `b`, `a`, `post`, `dev`, etc.). The resolved version is
 then read back and used for the release commit + tag.
@@ -123,9 +123,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "version",
         nargs="?",
-        default="minor",
+        default="patch",
         help="Literal version (0.3.5) or hatch segment (patch/minor/major/rc/...). "
-        "Default: minor.",
+        "Default: patch.",
     )
     parser.add_argument(
         "--dry-run",
