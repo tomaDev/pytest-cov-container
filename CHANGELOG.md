@@ -4,10 +4,13 @@
 
 ### Fixed
 
-- **Layers built with `BuildMethod: python3.x` are measured.** SAM builds
-  their `ContentUri` files into `/opt/python/`, but the preset mapped them to
-  `/opt`, so no layer line was ever collected. Other layers (no build method,
-  `makefile`) keep `/opt` (`frameworks.py`).
+- **Layers are measured where `sam build` put them.** The preset mapped every
+  layer's `ContentUri` to `/opt`, so a layer whose build moves its files
+  collected nothing: `BuildMethod: python3.x` (files under `/opt/python/`) or
+  a Makefile that rearranges them. The preset now matches each source file to
+  the identical file in the layer's build output and maps by that; before a
+  build it goes by `BuildMethod`, and it warns when the build holds none of
+  the layer's sources (`frameworks.py`).
 
 ### Removed
 
@@ -18,7 +21,8 @@
 ### Internal
 
 - **E2E suite** (`tests/e2e/`): a small SAM project run with `--cov` against
-  real `sam local` containers: `invoke` pushes (handler and layer lines),
+  real `sam local` containers: `invoke` pushes (handler lines, a pip-built
+  and a Makefile-built layer),
   `start-api` flushed over `SIGUSR1` next to a Node function, and xdist
   workers. Marked `e2e`, off by default; `hatch test -m e2e -n 0`.
 

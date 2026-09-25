@@ -10,6 +10,7 @@ pytestmark = pytest.mark.e2e
 
 SYNC = "src/sync/app.py"
 LAYER = "src/layers/shared/shared/util.py"
+MADE_LAYER = "src/layers/made/src/made/greet.py"
 _RUN_TIMEOUT_S = 900
 
 
@@ -48,19 +49,21 @@ def test_invoke_pushes_after_each_call(app):
     """`sam local invoke` removes its container right after the call."""
     _passed(run_pytest(app, "tests/test_invoke.py"))
     lines = covered_lines(app)
-    assert {7, 8, 9, 11, 12} <= lines[SYNC]
+    assert {8, 9, 10, 12, 13} <= lines[SYNC]
     assert {2} <= lines[LAYER]  # layer code, built into /opt/python
+    assert {2} <= lines[MADE_LAYER]  # built by a Makefile that moves src/ to python/
 
 
 def test_flush_of_warm_start_api_containers(app):
     _passed(run_pytest(app, "tests/test_api.py"))
     lines = covered_lines(app)
-    assert {7, 8, 9, 12} <= lines[SYNC]
+    assert {8, 9, 10, 13} <= lines[SYNC]
     assert {2} <= lines[LAYER]
+    assert {2} <= lines[MADE_LAYER]
 
 
 def test_xdist_workers_each_receive_their_own_containers(app):
     # One invoke per worker: each branch arm is only covered when its
     # worker's sink received that worker's container push.
     _passed(run_pytest(app, "tests/test_invoke.py", "-n", "2"))
-    assert {7, 8, 9, 11, 12} <= covered_lines(app)[SYNC]
+    assert {8, 9, 10, 12, 13} <= covered_lines(app)[SYNC]

@@ -6,12 +6,9 @@ from pathlib import Path
 
 import coverage
 
-from pytest_cov_container import protocol
+from pytest_cov_container import frameworks, protocol
 from pytest_cov_container.frameworks import FunctionTarget
 
-# Directory names never measured: test trees and caches are not deployed, and
-# dot-dirs (``.venv``, ``.aws-sam``) hold third-party or build copies.
-_SOURCE_SKIP_DIRS = frozenset({"__pycache__", "tests"})
 _BOOT_SOURCE = Path(__file__).with_name("_boot.py")
 
 
@@ -33,11 +30,7 @@ def include_patterns(target: FunctionTarget, rootpath: Path) -> list[str]:
             msg = f"{target.name}: source directory {host_dir} does not exist"
             raise FileNotFoundError(msg)
         root = mapping.container_dir.rstrip("/")
-        for path in sorted(host_dir.rglob("*.py")):
-            rel = path.relative_to(host_dir)
-            if any(part in _SOURCE_SKIP_DIRS or part.startswith(".") for part in rel.parts[:-1]):
-                continue
-            patterns.append(f"{root}/{rel.as_posix()}")
+        patterns.extend(f"{root}/{rel.as_posix()}" for rel in frameworks.source_files(host_dir))
     return patterns
 
 

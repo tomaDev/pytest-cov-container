@@ -74,9 +74,9 @@ class TestAwsSamFramework:
         )
 
     @pytest.mark.parametrize(("build_method", "layer_root"), [("python3.14", "/opt/python"), ("makefile", "/opt")])
-    def test_a_python_built_layer_sits_under_opt_python(self, sam_project, build_method, layer_root):
-        # `BuildMethod: python3.x` puts the ContentUri's files under python/;
-        # any other build copies the ContentUri tree (which holds python/) as is.
+    def test_an_unbuilt_layer_is_placed_by_its_build_method(self, sam_project, build_method, layer_root):
+        # No build output to read: `BuildMethod: python3.x` puts the ContentUri's
+        # files under python/; any other build copies the tree (which holds python/).
         template = sam_project / "template.yaml"
         template.write_text(
             template.read_text().replace(
@@ -168,3 +168,59 @@ class TestAwsSamFramework:
         result = _load(sam_project, 'label = ""\nmount_prefix = ""\n')
         assert not result.label
         assert not result.mount_prefix
+
+
+def _build_layer(root, files: dict[str, str], sources: dict[str, str] | None = None) -> None:
+    """``sam build`` output for SharedLayer (``files`` under its build dir), optionally replacing its sources."""
+    if sources is not None:
+        shared = root / "src/shared"
+        for path in sorted(shared.rglob("*"), reverse=True):
+            path.unlink() if path.is_file() else path.rmdir()
+        for rel, text in sources.items():
+            (shared / rel).parent.mkdir(parents=True, exist_ok=True)
+            (shared / rel).write_text(text)
+    build_root = root / ".aws-sam/build"
+    (build_root / "template.yaml").write_text(
+        "Resources:\n  SharedLayer:\n    Type: AWS::Serverless::LayerVersion\n    Properties:\n      ContentUri: SharedLayer\n"
+    )
+    for rel, text in files.items():
+        (build_root / "SharedLayer" / rel).parent.mkdir(parents=True, exist_ok=True)
+        (build_root / "SharedLayer" / rel).write_text(text)
+
+
+class TestLayerLayoutFromTheBuild:
+    """Where a layer's files land is read off ``sam build``'s output, whatever built it."""
+
+    def _shared(self, root) -> tuple[SourceMapping, ...]:
+        api = _targets(_load(root))["ApiFunction"]
+        return api.mappings[1:]
+
+    def test_a_tree_copied_as_is_sits_at_opt(self, sam_project):
+        _build_layer(sam_project, {"python/shared/util.py": "X = 1\n"})
+        assert self._shared(sam_project) == (SourceMapping("src/shared", "/opt"),)
+
+    def test_files_built_into_python_sit_at_opt_python(self, sam_project):
+        _build_layer(sam_project, {"python/shared/util.py": "X = 1\n"}, sources={"shared/util.py": "X = 1\n"})
+        assert self._shared(sam_project) == (SourceMapping("src/shared", "/opt/python"),)
+
+    def test_a_subdirectory_built_into_python_maps_on_its_own(self, sam_project):
+        # e.g. a Makefile that copies src/ into $(ARTIFACTS_DIR)/python/
+        _build_layer(
+            sam_project,
+            {"python/pkg/x.py": "X = 1\n", "python/pkg/__init__.py": ""},
+            sources={"src/pkg/x.py": "X = 1\n", "src/pkg/__init__.py": "", "Makefile": ""},
+        )
+        assert self._shared(sam_project) == (SourceMapping("src/shared/src", "/opt/python"),)
+
+    def test_a_dependency_with_the_same_name_is_not_a_match(self, sam_project):
+        _build_layer(
+            sam_project,
+            {"python/vendor/shared/util.py": "VENDORED = 1\n", "python/shared/util.py": "X = 1\n"},
+            sources={"shared/util.py": "X = 1\n"},
+        )
+        assert self._shared(sam_project) == (SourceMapping("src/shared", "/opt/python"),)
+
+    def test_no_source_file_in_the_build_warns_and_falls_back(self, sam_project):
+        _build_layer(sam_project, {"python/other.py": "Y = 2\n"})
+        with pytest.warns(UserWarning, match="SharedLayer: none of its source files"):
+            assert self._shared(sam_project) == (SourceMapping("src/shared", "/opt"),)

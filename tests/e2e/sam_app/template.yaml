@@ -23,6 +23,15 @@ Resources:
     Metadata:
       BuildMethod: python3.14
 
+  # Built by its Makefile, which moves src/ to python/.
+  MadeLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      ContentUri: src/layers/made/
+      CompatibleRuntimes: [python3.14]
+    Metadata:
+      BuildMethod: makefile
+
   SyncFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -31,6 +40,7 @@ Resources:
       Runtime: python3.14
       Layers:
         - Ref: SharedLayer
+        - Ref: MadeLayer
       Events:
         Api:
           Type: Api

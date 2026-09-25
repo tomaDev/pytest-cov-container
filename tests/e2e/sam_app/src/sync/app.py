@@ -1,5 +1,6 @@
 import json
 
+from made import greet
 from shared import util
 
 
@@ -9,4 +10,4 @@ def handler(event, context):
         sign = util.label("positive")
     else:
         sign = util.label("non-positive")
-    return {"statusCode": 200, "body": json.dumps({"sign": sign})}
+    return {"statusCode": 200, "body": json.dumps({"sign": sign, "greeting": greet.hello()})}
