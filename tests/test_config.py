@@ -73,6 +73,20 @@ class TestAwsSamFramework:
             SourceMapping("src/extra", "/opt"),
         )
 
+    @pytest.mark.parametrize(("build_method", "layer_root"), [("python3.14", "/opt/python"), ("makefile", "/opt")])
+    def test_a_python_built_layer_sits_under_opt_python(self, sam_project, build_method, layer_root):
+        # `BuildMethod: python3.x` puts the ContentUri's files under python/;
+        # any other build copies the ContentUri tree (which holds python/) as is.
+        template = sam_project / "template.yaml"
+        template.write_text(
+            template.read_text().replace(
+                "      ContentUri: src/extra/\n",
+                f"      ContentUri: src/extra/\n    Metadata:\n      BuildMethod: {build_method}\n",
+            )
+        )
+        worker = _targets(_load(sam_project))["Worker"]
+        assert worker.mappings[2] == SourceMapping("src/extra", layer_root)
+
     def test_build_dirs_come_from_the_built_template(self, sam_project):
         (sam_project / ".aws-sam/build/template.yaml").write_text(
             "Resources:\n"

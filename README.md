@@ -39,7 +39,7 @@ For `framework = "aws-sam"` the preset reads `template.yaml`:
 |-----|-------------|
 | functions | every zip Python function with a local `CodeUri` (or the `functions` list) |
 | build dir | from `sam build`'s own template (`.aws-sam/build/<dir>`; functions that share code share one), else `.aws-sam/build/<logical id>` |
-| sources | the function's `CodeUri` at `/var/task`, and each local layer's `ContentUri` at `/opt` (Globals and function `Layers`) |
+| sources | the function's `CodeUri` at `/var/task`, and each local layer's `ContentUri` at `/opt`, or `/opt/python` for `BuildMethod: python3.x` (Globals and function `Layers`) |
 | `label` | `sam.cli.container.type=lambda` (set by SAM CLI 1.165+ on every Lambda container) |
 | `mount_prefix` | the build root: only this checkout's containers |
 
@@ -145,6 +145,9 @@ prek install
 # Run tests
 hatch test
 
+# Run the e2e suite: real `sam local` containers (needs Docker and SAM CLI)
+hatch test -m e2e -n 0
+
 # Run across all Python versions
 hatch test --all
 
@@ -157,7 +160,7 @@ hatch run types:check
 # Security scan
 hatch run security:scan
 
-# Cut a release: test every Python, then bump + commit + tag + push in one shot. Pass a version
+# Cut a release: test every Python and run the e2e suite, then bump + commit + tag + push in one shot. Pass a version
 # literal or a hatch segment (`patch`, `minor`, `major`, `rc`, etc.).
 # Omit the arg to bump the minor version.
 hatch run release           # 0.2.0 → 0.3.0

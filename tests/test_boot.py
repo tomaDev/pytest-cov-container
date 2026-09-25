@@ -36,28 +36,6 @@ module = importlib.import_module(sys.argv[2])
 print(module.handler({"n": 5}, None))
 """
 
-ASYNC_HANDLER = """\
-import asyncio
-
-
-async def handler(event, context):
-    await asyncio.sleep(0)
-    if event["n"] > 1:
-        return "big"
-    return "small"
-"""
-
-# A runtime that awaits an ``async def`` handler.
-ASYNC_RUNTIME = """\
-import asyncio, site, sys
-task_root = sys.argv[1]
-sys.path.insert(0, task_root)
-site.addsitedir(task_root)
-import importlib
-module = importlib.import_module(sys.argv[2])
-print(asyncio.run(module.handler({"n": 5}, None)))
-"""
-
 SERVER = """\
 import site, sys, time
 site.addsitedir(sys.argv[1])
@@ -66,27 +44,18 @@ time.sleep(30)
 """
 
 
-def _build(tmp_path: Path, handler: str) -> Path:
+@pytest.fixture
+def task(tmp_path):
     """A built function whose task root is a host dir, injected by the plugin."""
     source = tmp_path / "src" / "fn"
     source.mkdir(parents=True)
-    (source / "handler.py").write_text(handler)
+    (source / "handler.py").write_text(HANDLER)
     build = tmp_path / "build" / "Fn"
     build.mkdir(parents=True)
-    (build / "handler.py").write_text(handler)
+    (build / "handler.py").write_text(HANDLER)
     target = FunctionTarget("Fn", str(build), str(build), (SourceMapping(str(source), str(build)),))
     inject.inject(target, rootpath=tmp_path, branch=True)
     return build
-
-
-@pytest.fixture
-def task(tmp_path):
-    return _build(tmp_path, HANDLER)
-
-
-@pytest.fixture
-def async_task(tmp_path):
-    return _build(tmp_path, ASYNC_HANDLER)
 
 
 @pytest.fixture
@@ -134,24 +103,6 @@ def test_pushes_after_each_handler_call(task, sink, tmp_path):
     # The handler module was measured from its first line: coverage started
     # before the runtime imported it.
     assert _lines(body, tmp_path) == {"handler.py": [1, 2, 3, 7, 8]}
-
-
-def test_an_async_handler_pushes_after_its_body_ran(async_task, sink, tmp_path):
-    # Calling an async handler only creates the coroutine; a push at that
-    # point would miss the body. The atexit push comes later and has it all,
-    # so only the first push tells.
-    out = subprocess.run(
-        [sys.executable, "-c", ASYNC_RUNTIME, str(async_task), "handler"],
-        check=False,
-        env=_env(async_task, sink, tmp_path),
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    assert out.returncode == 0, out.stderr
-    assert out.stdout.strip() == "big"
-    (_, _, body), *_ = sink.pushes
-    assert _lines(body, tmp_path) == {"handler.py": [1, 4, 5, 6, 7]}
 
 
 def test_inert_without_the_sink(task, sink, tmp_path):

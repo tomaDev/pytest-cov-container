@@ -66,6 +66,10 @@ check = "ty check src/"
 [tool.hatch.envs.default.scripts]
 release = "python scripts/release.py {args}"
 
+[tool.pytest.ini_options]
+markers = ["e2e: runs real sam local containers (needs Docker and SAM CLI); run with -m e2e"]
+addopts = ["-m", "not e2e"]
+
 [tool.bandit]
 exclude_dirs = ["tests"]
 skips = ["B108", "B404", "B603"]

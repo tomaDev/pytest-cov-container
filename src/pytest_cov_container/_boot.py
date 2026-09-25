@@ -11,7 +11,6 @@ import atexit
 import functools
 import importlib.abc
 import importlib.util
-import inspect
 import os
 import signal
 import socket
@@ -83,20 +82,9 @@ class _WrapHandler:
             setattr(module, self.attr, self._wrap(handler))
 
     def _wrap(self, handler):
+        # Sync only: the Lambda Python runtime never awaits an ``async def``
+        # handler (it fails to marshal the coroutine), so there is none to wrap.
         after_call = self.after_call
-
-        if inspect.iscoroutinefunction(handler):
-            # An async handler only runs once its coroutine is awaited; the
-            # runtime does that after this call returns, so the push has to
-            # wait for it too, or it ships the invocation's coverage early.
-            @functools.wraps(handler)
-            async def wrapped(*args, **kwargs):
-                try:
-                    return await handler(*args, **kwargs)
-                finally:
-                    after_call()
-
-            return wrapped
 
         @functools.wraps(handler)
         def wrapped(*args, **kwargs):

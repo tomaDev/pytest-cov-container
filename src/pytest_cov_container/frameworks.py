@@ -83,6 +83,18 @@ def _relative_to_root(path: Path, rootpath: Path) -> str:
         return path.resolve().as_posix()
 
 
+def _layer_root(layer: Mapping[str, Any]) -> str:
+    """Where a layer's ``ContentUri`` files land in the container.
+
+    ``BuildMethod: python3.x`` builds them into ``python/``; any other build
+    (none, ``makefile``) keeps the ``ContentUri`` tree, which then holds ``python/``.
+    """
+    build_method = (layer.get("Metadata") or {}).get("BuildMethod")
+    if isinstance(build_method, str) and build_method.startswith("python"):
+        return f"{_SAM_LAYER_ROOT}/python"
+    return _SAM_LAYER_ROOT
+
+
 class _SamTemplate:
     def __init__(self, path: Path, rootpath: Path):
         self.path = path
@@ -125,7 +137,7 @@ class _SamTemplate:
                 continue
             content = (resource.get("Properties") or {}).get("ContentUri")
             if isinstance(content, str):
-                mappings.append(SourceMapping(self._source(content), _SAM_LAYER_ROOT))
+                mappings.append(SourceMapping(self._source(content), _layer_root(resource)))
         return mappings
 
     def mappings(self, name: str) -> list[SourceMapping]:

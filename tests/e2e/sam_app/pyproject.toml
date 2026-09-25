@@ -1,0 +1,7 @@
+[tool.pytest-cov-container]
+framework = "aws-sam"
+worker_env = "COV_WORKER"
+required = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

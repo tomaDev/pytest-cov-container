@@ -2,14 +2,33 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Layers built with `BuildMethod: python3.x` are measured.** SAM builds
+  their `ContentUri` files into `/opt/python/`, but the preset mapped them to
+  `/opt`, so no layer line was ever collected. Other layers (no build method,
+  `makefile`) keep `/opt` (`frameworks.py`).
+
+### Removed
+
+- **Async handler wrapping.** 0.5.0 made the bootstrap await `async def`
+  handlers before pushing. The Lambda Python runtime never awaits them (it
+  fails with `Runtime.MarshalError`), so that code could not run (`_boot.py`).
+
 ### Internal
+
+- **E2E suite** (`tests/e2e/`): a small SAM project run with `--cov` against
+  real `sam local` containers: `invoke` pushes (handler and layer lines),
+  `start-api` flushed over `SIGUSR1` next to a Node function, and xdist
+  workers. Marked `e2e`, off by default; `hatch test -m e2e -n 0`.
 
 - **Pre-commit hooks (prek)**: `.pre-commit-config.yaml` runs the built-in
   file checks, ty, bandit, zizmor on workflow changes and `hatch test` on
   every commit that touches `src/`, `tests/` or `pyproject.toml`.
-- **Releases test every Python**: `hatch run release` runs `hatch test --all`
-  before it bumps and refuses on failure (`scripts/release.py`).
-- Tests for the async-handler push timing and the `container_root` check.
+- **Releases test every Python and real containers**: `hatch run release`
+  runs `hatch test --all` and the e2e suite before it bumps and refuses on
+  failure (`scripts/release.py`).
+- Test for the `container_root` check.
 
 ## 0.5.0 — 2026-09-24
 

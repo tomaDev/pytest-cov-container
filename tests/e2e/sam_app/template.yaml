@@ -1,0 +1,54 @@
+# The e2e suite's SAM project. Long-form intrinsics only (`Ref:`), so the
+# plain YAML check in the pre-commit hooks can load it.
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Globals:
+  Function:
+    Timeout: 30
+    Environment:
+      Variables:
+        # `sam local --env-vars` only overrides declared variables; empty, the
+        # injected bootstrap stays inert.
+        COVERAGE_PROCESS_START: ""
+        COV_CONTAINER_SINK: ""
+        COV_WORKER: ""
+
+Resources:
+  SharedLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      ContentUri: src/layers/shared/
+      CompatibleRuntimes: [python3.14]
+    Metadata:
+      BuildMethod: python3.14
+
+  SyncFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/sync/
+      Handler: app.handler
+      Runtime: python3.14
+      Layers:
+        - Ref: SharedLayer
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            Path: /sync
+            Method: get
+
+  # Not measured: the preset skips non-Python runtimes, and a flush must pass
+  # over its container quietly.
+  NodeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/node/
+      Handler: index.handler
+      Runtime: nodejs22.x
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            Path: /node
+            Method: get
