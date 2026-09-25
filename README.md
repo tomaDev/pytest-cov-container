@@ -138,6 +138,10 @@ Ownership still matters for flushing long-running servers and for cleanup: image
 ## Development
 
 ```console
+# Install the pre-commit hooks (once per clone): checks, ty, bandit and
+# `hatch test` run on every commit
+prek install
+
 # Run tests
 hatch test
 
@@ -153,7 +157,7 @@ hatch run types:check
 # Security scan
 hatch run security:scan
 
-# Cut a release: bump + commit + tag + push in one shot. Pass a version
+# Cut a release: test every Python, then bump + commit + tag + push in one shot. Pass a version
 # literal or a hatch segment (`patch`, `minor`, `major`, `rc`, etc.).
 # Omit the arg to bump the minor version.
 hatch run release           # 0.2.0 → 0.3.0

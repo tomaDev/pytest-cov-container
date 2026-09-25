@@ -1,0 +1,43 @@
+# Run with: prek run --all-files
+# Install once per clone: prek install
+fail_fast: true
+
+repos:
+  - repo: builtin
+    hooks:
+      - id: check-added-large-files
+        args: [--maxkb=500]
+      - id: check-merge-conflict
+      - id: detect-private-key
+      - id: check-yaml
+      - id: check-toml
+
+  - repo: local
+    hooks:
+      - id: types
+        name: ty type check
+        language: system
+        entry: hatch run types:check
+        pass_filenames: false
+        files: ^(src/.*\.py|pyproject\.toml)$
+      - id: security
+        name: bandit security scan
+        language: system
+        entry: hatch run security:scan
+        pass_filenames: false
+        files: ^(src/.*\.py|pyproject\.toml)$
+      - id: zizmor
+        name: zizmor (GitHub Actions security)
+        language: system
+        # --offline: no GITHUB_TOKEN locally; the static audits still run.
+        entry: zizmor --offline
+        files: ^\.github/workflows/.*\.ya?ml$
+      - id: hatch-test
+        name: hatch test (default Python)
+        language: system
+        # Last, so the cheap checks fail first. One Python per commit; the
+        # release script also runs the full matrix (`hatch test --all`)
+        # before it bumps.
+        entry: hatch test
+        pass_filenames: false
+        files: ^(src/|tests/|pyproject\.toml$)

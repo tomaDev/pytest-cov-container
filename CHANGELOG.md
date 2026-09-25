@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Internal
+
+- **Pre-commit hooks (prek)**: `.pre-commit-config.yaml` runs the built-in
+  file checks, ty, bandit, zizmor on workflow changes and `hatch test` on
+  every commit that touches `src/`, `tests/` or `pyproject.toml`.
+- **Releases test every Python**: `hatch run release` runs `hatch test --all`
+  before it bumps and refuses on failure (`scripts/release.py`).
+- Tests for the async-handler push timing and the `container_root` check.
+
 ## 0.5.0 — 2026-09-24
 
 ### Changed

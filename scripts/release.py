@@ -21,10 +21,11 @@ Workflow:
     1. Verify clean working tree on main (BEFORE any mutation).
     2. `git fetch origin main`, then fast-forward local main if behind.
        Refuses if origin/main has diverged.
-    3. Bump __about__.py, commit "release X.Y.Z".
-    4. Verify the resolved tag does not already exist locally or on origin.
-    5. Push main.
-    6. Create and push the tag.
+    3. Run `hatch test --all` (every supported Python); refuse on failure.
+    4. Bump __about__.py, commit "release X.Y.Z" (every pre-commit hook runs).
+    5. Verify the resolved tag does not already exist locally or on origin.
+    6. Push main.
+    7. Create and push the tag.
 
 `--dry-run` skips every mutating step (merge, bump, commit, push, tag) and
 prints what would have run. Read-only checks (branch, status, fetch, tag
@@ -166,6 +167,15 @@ def main(argv: list[str] | None = None) -> int:
     if int(behind) > 0:
         print(f"fast-forwarding {behind} commit(s) from origin/main")
         _mutate("git", "merge", "--ff-only", "origin/main", dry_run=dry_run)
+
+    # Every supported Python, BEFORE the bump: a failure leaves nothing to undo.
+    # Read-only, so it runs under --dry-run too.
+    print("running the test matrix (hatch test --all)")
+    try:
+        _run("hatch", "test", "--all")
+    except subprocess.CalledProcessError:
+        print("error: tests failed; nothing was bumped", file=sys.stderr)
+        return 1
 
     # Under dry-run, check the predicted version against the tag space; fall
     # back to the current __about__.py when it cannot be predicted (rc, dev).
