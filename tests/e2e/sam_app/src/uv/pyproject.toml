@@ -2,4 +2,8 @@
 name = "uv-function"
 version = "0.1.0"
 requires-python = ">=3.14"
-dependencies = []
+dependencies = ["common"]
+
+[tool.uv.sources]
+# Not editable: an editable install would ship a link to this checkout.
+common = { path = "../libs/common", editable = false }

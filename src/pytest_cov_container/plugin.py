@@ -274,7 +274,8 @@ class ContainerCovPlugin:
         mapper = self._mappers.get(target.name)
         if mapper is None:
             mapper = PathAliases()
-            for mapping in target.mappings:
+            # The first matching alias wins: a package inside /var/task before the code at /var/task.
+            for mapping in sorted(target.mappings, key=lambda m: len(m.container_dir.rstrip("/")), reverse=True):
                 host = Path(mapping.host_dir)
                 mapper.add(mapping.container_dir, str(host if host.is_absolute() else self.rootpath / host))
             self._mappers[target.name] = mapper

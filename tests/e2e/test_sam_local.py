@@ -12,6 +12,7 @@ SYNC = "src/sync/app.py"
 LAYER = "src/layers/shared/shared/util.py"
 MADE_LAYER = "src/layers/made/src/made/greet.py"
 UV = "src/uv/app.py"
+PACKAGE = "src/libs/common/python/common/greet.py"
 _RUN_TIMEOUT_S = 900
 
 
@@ -55,8 +56,11 @@ def test_invoke_pushes_after_each_call(app):
     assert {2} <= lines[MADE_LAYER]  # built by a Makefile that moves src/ to python/
     # uv's build leaves its lock file next to the code.
     assert (app / ".aws-sam/build/UvFunction/uv.lock").is_file()
-    assert {5, 6} <= lines[UV]
-    assert 7 not in lines[UV]
+    assert {7, 8} <= lines[UV]
+    assert 9 not in lines[UV]
+    # A local package the uv function depends on, installed into /var/task/common/.
+    assert {2, 3} <= lines[PACKAGE]
+    assert 4 not in lines[PACKAGE]
 
 
 def test_flush_of_warm_start_api_containers(app):

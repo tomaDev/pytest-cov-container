@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Added
+
+- **Local uv packages are measured.** A function that depends on a local
+  package through a `[tool.uv.sources]` `path` entry gets that package
+  installed into its build dir, under `/var/task`, by the `python-uv` build.
+  The preset now finds each of the package's source files in the function's
+  build output and maps its top-level package dirs back to their sources, so a
+  code-sharing package replaces a layer without losing its coverage. It warns
+  when the build holds none of the package's files, e.g. an editable source
+  (`frameworks.py`).
+
+### Fixed
+
+- **A more specific container path maps first.** Coverage takes the first
+  alias that matches, so `/var/task` could claim `/var/task/<package>/…`
+  files when the code dir held the same relative path; aliases are now added
+  longest container path first (`plugin.py`).
+
 ### Internal
 
 - `hatch run release` with no argument bumps the patch version, not the

@@ -224,3 +224,102 @@ class TestLayerLayoutFromTheBuild:
         _build_layer(sam_project, {"python/other.py": "Y = 2\n"})
         with pytest.warns(UserWarning, match="SharedLayer: none of its source files"):
             assert self._shared(sam_project) == (SourceMapping("src/shared", "/opt"),)
+
+
+def _build_function(root, function: str, files: dict[str, str]) -> None:
+    """``sam build`` output for ``function`` (``files`` under its build dir)."""
+    build_root = root / ".aws-sam/build"
+    (build_root / "template.yaml").write_text(
+        f"Resources:\n  {function}:\n    Type: AWS::Serverless::Function\n    Properties:\n      CodeUri: {function}\n"
+    )
+    for rel, text in files.items():
+        (build_root / function / rel).parent.mkdir(parents=True, exist_ok=True)
+        (build_root / function / rel).write_text(text)
+
+
+def _write(root, files: dict[str, str]) -> None:
+    for rel, text in files.items():
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text(text)
+
+
+# A package under a module root (uv_build ``module-root = "python"``), with
+# the files a package checkout holds but never ships.
+_PACKAGE = {
+    "src/common/pyproject.toml": "[project]\nname = 'common'\n",
+    "src/common/python/common/__init__.py": "",
+    "src/common/python/common/net.py": "def get():\n    return 1\n",
+    "src/common/python/common/sub/deep.py": "Z = 3\n",
+    "src/common/tests/test_net.py": "",
+    "src/common/.venv/lib/site.py": "",
+}
+
+
+class TestUvPathSources:
+    """A local package the function depends on is measured where ``sam build`` put it."""
+
+    def _uses(self, root, sources: str) -> None:
+        (root / "src/api/pyproject.toml").write_text(f"[project]\nname = 'api'\n\n[tool.uv.sources]\n{sources}")
+
+    def _packages(self, root) -> tuple[SourceMapping, ...]:
+        api = _targets(_load(root))["ApiFunction"]
+        # The code at /var/task and the Globals layer come first.
+        assert api.mappings[:2] == (SourceMapping("src/api", "/var/task"), SourceMapping("src/shared", "/opt"))
+        return api.mappings[2:]
+
+    def test_a_path_source_maps_each_top_level_package(self, sam_project):
+        _write(sam_project, _PACKAGE)
+        self._uses(sam_project, 'common = { path = "../common", editable = false }\n')
+        _build_function(
+            sam_project,
+            "ApiFunction",
+            {
+                "app.py": "def f():\n    return 1\n",
+                "common/__init__.py": "",
+                "common/net.py": "def get():\n    return 1\n",
+                "common/sub/deep.py": "Z = 3\n",
+                # A dependency's empty __init__.py must not claim the package's.
+                "vendor/__init__.py": "",
+            },
+        )
+        assert self._packages(sam_project) == (SourceMapping("src/common/python/common", "/var/task/common"),)
+
+    def test_a_flat_layout_package(self, sam_project):
+        _write(sam_project, {"src/lib/pyproject.toml": "", "src/lib/tool/run.py": "R = 1\n"})
+        self._uses(sam_project, 'tool = { path = "../lib" }\n')
+        _build_function(sam_project, "ApiFunction", {"tool/run.py": "R = 1\n"})
+        assert self._packages(sam_project) == (SourceMapping("src/lib/tool", "/var/task/tool"),)
+
+    def test_a_source_list_with_markers(self, sam_project):
+        _write(sam_project, _PACKAGE)
+        self._uses(sam_project, 'common = [{ path = "../common", marker = "sys_platform == \'linux\'" }]\n')
+        _build_function(sam_project, "ApiFunction", {"common/net.py": "def get():\n    return 1\n"})
+        assert self._packages(sam_project) == (SourceMapping("src/common/python/common", "/var/task/common"),)
+
+    def test_other_sources_are_not_packages_here(self, sam_project):
+        _write(sam_project, {"src/wheels/pkg-1.0-py3-none-any.whl": ""})
+        self._uses(
+            sam_project,
+            'a = { git = "https://example.com/a.git" }\nb = { index = "internal" }\nc = { workspace = true }\n'
+            'd = { url = "https://example.com/d.whl" }\ne = { path = "../wheels/pkg-1.0-py3-none-any.whl" }\n'
+            'f = { path = "../missing" }\n',
+        )
+        _build_function(sam_project, "ApiFunction", {"app.py": "def f():\n    return 1\n"})
+        assert self._packages(sam_project) == ()
+
+    def test_a_package_changed_since_the_build_is_not_matched(self, sam_project):
+        # e.g. an editable install: the build holds a link, not the files.
+        _write(sam_project, _PACKAGE)
+        self._uses(sam_project, 'common = { path = "../common" }\n')
+        _build_function(sam_project, "ApiFunction", {"common/net.py": "def get():\n    return 2\n"})
+        with pytest.warns(UserWarning, match=r"ApiFunction: none of \.\./common's source files"):
+            assert self._packages(sam_project) == ()
+
+    def test_before_a_build_packages_are_skipped_quietly(self, sam_project):
+        _write(sam_project, _PACKAGE)
+        self._uses(sam_project, 'common = { path = "../common" }\n')
+        assert self._packages(sam_project) == ()
+
+    def test_a_function_without_a_pyproject_has_no_packages(self, sam_project):
+        _build_function(sam_project, "ApiFunction", {"app.py": "def f():\n    return 1\n"})
+        assert self._packages(sam_project) == ()

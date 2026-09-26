@@ -11,6 +11,7 @@ import pytest
 from coverage.data import CoverageData
 
 from pytest_cov_container import config, protocol
+from pytest_cov_container.frameworks import SourceMapping
 from pytest_cov_container.models import ContainerInfo
 from pytest_cov_container.plugin import ContainerCovPlugin
 
@@ -166,6 +167,25 @@ class TestOnPush:
             "/var/lang/lib/x.py",
         }
         assert not list(sam_project.glob(".cov-container-*.tmp"))
+
+    def test_a_package_under_var_task_maps_to_its_own_source(self, make_plugin, plugin_config, sam_project, tmp_path):
+        # The package's dir sits inside the code's /var/task: the longer container path must win,
+        # even where the code dir holds a file at the same relative path.
+        (sam_project / "src/common/python/common").mkdir(parents=True)
+        (sam_project / "src/common/python/common/net.py").write_text("def get():\n    return 1\n")
+        (sam_project / "src/api/common").mkdir()
+        (sam_project / "src/api/common/net.py").write_text("")
+        api = plugin_config.targets[0]
+        package = SourceMapping("src/common/python/common", "/var/task/common")
+        plugin_config.targets = (dataclasses.replace(api, mappings=(*api.mappings, package)),)
+        body = _data(tmp_path / "in", {"/var/task/app.py": [1], "/var/task/common/net.py": [1, 2]})
+        make_plugin()._on_push("abc123def456-7", "ApiFunction", body)
+        data = CoverageData(basename=str(sam_project / ".coverage.container-main-abc123def456-7"))
+        data.read()
+        assert data.measured_files() == {
+            str(sam_project / "src/api/app.py"),
+            str(sam_project / "src/common/python/common/net.py"),
+        }
 
     def test_a_later_push_of_the_same_process_replaces_it(self, make_plugin, sam_project, tmp_path):
         plugin = make_plugin()

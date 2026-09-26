@@ -7,6 +7,7 @@ recognised. Any key the project sets explicitly wins. One framework is
 supported today; the next consumer gets its own preset.
 """
 
+import tomllib
 import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -108,29 +109,69 @@ def _common_tail(a: tuple[str, ...], b: tuple[str, ...]) -> int:
     return n
 
 
-def _built_layout(source: Path, built: Path) -> list[tuple[tuple[str, ...], tuple[str, ...]]] | None:
-    """How ``sam build`` placed ``source``'s files in ``built``: ``(source subdir, built subdir)`` pairs.
+def _built_matches(source: Path, built: Path) -> list[tuple[tuple[str, ...], tuple[str, ...], int]]:
+    """Where ``sam build`` put each of ``source``'s files in ``built``.
 
-    Each source file matches the built file with the same bytes and the
-    longest common path tail (a vendored dependency may share its name); what
-    precedes the tail on each side is the pair. None when no source file is in
-    the build.
+    ``(source path, built path, common tail)`` per matched file: the built file
+    with the same bytes and the longest common path tail (a vendored
+    dependency may share its name).
     """
     by_name: dict[str, list[Path]] = {}
     for path in built.rglob("*.py"):
         by_name.setdefault(path.name, []).append(path.relative_to(built))
-    pairs = set()
+    matches = []
     for rel in source_files(source):
+        # Longest tail first, so a common name (``__init__.py``) reads few files.
+        candidates = sorted((-_common_tail(rel.parts, c.parts), c) for c in by_name.get(rel.name, ()))
         content = (source / rel).read_bytes()
-        best: tuple[int, Path] | None = None
-        for candidate in sorted(by_name.get(rel.name, ())):
-            tail = _common_tail(rel.parts, candidate.parts)
-            if (best is None or tail > best[0]) and (built / candidate).read_bytes() == content:
-                best = (tail, candidate)
-        if best is not None:
-            tail, candidate = best
-            pairs.add((rel.parts[:-tail], candidate.parts[:-tail]))
+        for negative_tail, candidate in candidates:
+            if (built / candidate).read_bytes() == content:
+                matches.append((rel.parts, candidate.parts, -negative_tail))
+                break
+    return matches
+
+
+def _built_layout(source: Path, built: Path) -> list[tuple[tuple[str, ...], tuple[str, ...]]] | None:
+    """How ``sam build`` placed ``source``'s files in ``built``: ``(source subdir, built subdir)`` pairs.
+
+    What precedes each matched file's common tail on each side is the pair.
+    None when no source file is in the build.
+    """
+    pairs = {(rel[:-tail], candidate[:-tail]) for rel, candidate, tail in _built_matches(source, built)}
     return sorted(pairs) or None
+
+
+def _built_packages(source: Path, built: Path) -> list[tuple[tuple[str, ...], tuple[str, ...]]] | None:
+    """Each top-level package of ``source`` and its dir in ``built``: ``(source dir, built dir)`` pairs.
+
+    Unlike a layer's layout, a package shares ``/var/task`` with the function's
+    code, so it maps by its own package dirs, never by the build root.
+    """
+    matches = _built_matches(source, built)
+    pairs = {
+        (rel[: len(rel) - tail + 1], candidate[: len(candidate) - tail + 1])
+        for rel, candidate, tail in matches
+        # A module file at the top of the build has no package dir of its own.
+        if tail > 1
+    }
+    return sorted(pairs) if matches else None
+
+
+def _path_sources(code_dir: Path) -> list[str]:
+    """The local directories ``code_dir``'s uv project depends on (``[tool.uv.sources]`` ``path``), as written."""
+    pyproject = code_dir / "pyproject.toml"
+    if not pyproject.is_file():
+        return []
+    with pyproject.open("rb") as f:
+        sources = tomllib.load(f).get("tool", {}).get("uv", {}).get("sources", {})
+    paths = []
+    for spec in sources.values():
+        # One source, or a list of sources with markers.
+        for entry in spec if isinstance(spec, list) else [spec]:
+            path = entry.get("path") if isinstance(entry, Mapping) else None
+            if isinstance(path, str) and (code_dir / path).is_dir() and path not in paths:
+                paths.append(path)
+    return paths
 
 
 def _layer_root(layer: Mapping[str, Any]) -> str:
@@ -223,11 +264,45 @@ class _SamTemplate:
             return fallback
         return [SourceMapping(_join(source, host_sub), _join(_SAM_LAYER_ROOT, built_sub)) for host_sub, built_sub in layout]
 
+    def _package_mappings(self, name: str, code: str) -> list[SourceMapping]:
+        """The local packages the function's uv project depends on, where ``sam build`` put them.
+
+        ``python-uv`` installs a ``path`` source into the function's build dir
+        like any dependency, so its files sit under ``/var/task``; before a
+        build there is nowhere to read that from, and nothing to measure.
+        """
+        built_uri = self.built_uri(name, "CodeUri")
+        built = self.build_root / built_uri if built_uri else None
+        if built is None or not built.is_dir():
+            return []
+        code_dir = Path(code) if Path(code).is_absolute() else self.rootpath / code
+        mappings = []
+        for path in _path_sources(code_dir):
+            host = code_dir / path
+            source = _relative_to_root(host, self.rootpath)
+            packages = _built_packages(host, built)
+            if packages is None:
+                if source_files(host):
+                    warnings.warn(
+                        f"pytest-cov-container: {name}: none of {path}'s source files are in its build output "
+                        f"{built}; not measuring it (an editable install ships a link, not the files)",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                continue
+            mappings.extend(
+                SourceMapping(_join(source, host_dir), _join(_SAM_TASK_ROOT, built_dir))
+                for host_dir, built_dir in packages
+            )
+        return mappings
+
     def mappings(self, name: str) -> list[SourceMapping]:
         properties = self.resources[name].get("Properties") or {}
+        code = self._source(self._prop(properties, "CodeUri"))
         return [
-            SourceMapping(self._source(self._prop(properties, "CodeUri")), _SAM_TASK_ROOT),
+            SourceMapping(code, _SAM_TASK_ROOT),
             *self._layer_mappings(properties),
+            *self._package_mappings(name, code),
         ]
 
 
