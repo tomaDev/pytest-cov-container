@@ -77,9 +77,8 @@ jobs:
 
       # pytest's own args go after `--`: hatch test reads -r itself.
       # E2E_REQUIRED fails, not skips, when Docker or SAM is missing.
+      # --durations shows where the suite spends its time.
       - name: e2e suite
         env:
           E2E_REQUIRED: "1"
-        run: |
-          docker image ls 'public.ecr.aws/lambda/*'  # TEMP: were the pulls done?
-          uvx hatch test --python 3.14 -- -m e2e -n 0 -rA --durations=0
+        run: uvx hatch test --python 3.14 -- -m e2e -n 0 -rA --durations=0
