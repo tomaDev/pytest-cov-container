@@ -64,9 +64,14 @@ jobs:
         with:
           use-installer: true
 
+      - name: TEMP time image pulls
+        run: |
+          time docker pull -q public.ecr.aws/lambda/python:3.14-x86_64
+          time docker pull -q public.ecr.aws/lambda/nodejs:22-x86_64
+
       # pytest's own args go after `--`: hatch test reads -r itself.
       # E2E_REQUIRED fails, not skips, when Docker or SAM is missing.
       - name: e2e suite
         env:
           E2E_REQUIRED: "1"
-        run: uvx hatch test --python 3.14 -- -m e2e -n 0 -rA
+        run: uvx hatch test --python 3.14 -- -m e2e -n 0 -rA --durations=0
