@@ -1,0 +1,26 @@
+name: dependabot auto-merge
+
+# Queues patch and minor Dependabot updates to merge once the checks main
+# requires (ci.yaml) pass. Major updates wait for a review.
+on: pull_request
+
+permissions: {}
+
+jobs:
+  automerge:
+    if: github.event.pull_request.user.login == 'dependabot[bot]' && github.repository == 'tomaDev/pytest-cov-container'
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write # merge
+      pull-requests: write # enable auto-merge
+    steps:
+      - name: Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+
+      - name: Enable auto-merge
+        if: steps.metadata.outputs.update-type != 'version-update:semver-major'
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr merge --auto --squash "$PR_URL"

@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Internal
+
+- **CI on Linux.** A reusable `tests.yaml` runs the unit suite on every
+  supported Python and the e2e suite (real `sam local` containers on an
+  `ubuntu-26.04` runner, the first real run of the Linux `docker0` sink).
+  `ci.yaml` runs both on pull requests; `release.yaml`
+  runs both before it builds, so nothing publishes unless they pass on Linux.
+- With `E2E_REQUIRED` set (CI), a missing Docker engine or SAM CLI fails the
+  e2e suite instead of skipping it (`tests/e2e/conftest.py`).
+- **Dependabot** (`.github/dependabot.yml`): weekly uv and GitHub Actions
+  updates, patch and minor grouped per ecosystem. `dependabot-automerge.yaml`
+  queues those to merge once CI passes; majors wait for a review.
+
+## 0.6.1 — 2026-09-26
+
 ### Added
 
 - **Local uv packages are measured.** The `python-uv` build installs each
@@ -22,6 +37,9 @@
   alias that matches, so `/var/task` could claim `/var/task/<package>/…`
   files when the code dir held the same relative path; aliases are now added
   longest container path first (`plugin.py`).
+- A local package whose `RECORD` lists a file missing from the build dir
+  warns instead of crashing collection; `RECORD` is read as UTF-8 and the
+  `*.dist-info` dir picked deterministically (`frameworks.py`).
 
 ### Internal
 

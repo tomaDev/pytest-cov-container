@@ -36,8 +36,14 @@ jobs:
           echo "Latest version on PyPI: $version"
           echo "PYPI_VERSION=$version" >> "$GITHUB_OUTPUT"
 
+  # Nothing is built or published until both suites pass on Linux.
+  tests:
+    permissions:
+      contents: read # checkout
+    uses: $/.github/workflows/tests.yaml
+
   setup_and_build:
-    needs: [check_pypi]
+    needs: [check_pypi, tests]
     name: project setup and build
     runs-on: ubuntu-26.04
     permissions:

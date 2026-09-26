@@ -1,0 +1,72 @@
+name: tests
+
+# Called by ci.yaml (pull requests) and release.yaml (before it builds).
+on: workflow_call
+
+permissions: {}
+
+jobs:
+  unit:
+    name: unit (${{ matrix.python }})
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read # checkout
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13", "3.14", "3.15"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          # No cache: release.yaml calls this workflow too.
+          enable-cache: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+          allow-prereleases: true
+
+      - name: Unit suite
+        env:
+          PYTHON: ${{ matrix.python }}
+        run: uvx hatch test --python "$PYTHON"
+
+  e2e:
+    name: e2e
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read # checkout
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: false
+
+      # sam_app's functions build with BuildMethod python3.14, which needs
+      # python3.14 on PATH.
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+
+      - name: Set up SAM CLI
+        uses: aws-actions/setup-sam@89ddb14d60e682855e3fea4be85b3c56485de310 # v3
+        with:
+          use-installer: true
+
+      # pytest's own args go after `--`: hatch test reads -r itself.
+      # E2E_REQUIRED fails, not skips, when Docker or SAM is missing.
+      - name: e2e suite
+        env:
+          E2E_REQUIRED: "1"
+        run: uvx hatch test --python 3.14 -- -m e2e -n 0 -rA
