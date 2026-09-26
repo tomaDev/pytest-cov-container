@@ -46,7 +46,7 @@ class FunctionTarget:
     name: str
     build_dir: str  # relative to rootdir, or absolute
     container_root: str
-    # The code first, then the local layers (merged over ``functions``).
+    # The code first, then the local layers, then the local uv packages (merged over ``functions``).
     mappings: tuple[SourceMapping, ...]
     functions: tuple[str, ...] = ()
 
@@ -133,7 +133,9 @@ def _built_matches(
         # Longest tail first, so a common name (``__init__.py``) reads few files.
         ranked = sorted((-_common_tail(rel, c.parts), c) for c in by_name.get(rel[-1], ()))
         for negative_tail, candidate in ranked:
-            if (built / candidate).read_bytes() == content:
+            built_path = built / candidate
+            # A RECORD-listed candidate need not exist (e.g. stripped after install).
+            if built_path.is_file() and built_path.read_bytes() == content:
                 matches.append((rel, candidate.parts, -negative_tail))
                 break
     return matches
@@ -193,13 +195,13 @@ def _normalized(name: str) -> str:
 
 def _installed_files(built: Path, name: str) -> list[Path] | None:
     """The ``*.py`` files the build installed for distribution ``name`` (its ``RECORD``), or None if not installed."""
-    for info in built.glob("*.dist-info"):
+    for info in sorted(built.glob("*.dist-info")):
         if _normalized(info.name.removesuffix(".dist-info").rpartition("-")[0]) != _normalized(name):
             continue
         record = info / "RECORD"
         if not record.is_file():
             return []
-        rows = (line.split(",", 1)[0] for line in record.read_text().splitlines())
+        rows = (line.split(",", 1)[0] for line in record.read_text(encoding="utf-8").splitlines())
         return [Path(row) for row in rows if row.endswith(".py") and not row.startswith("..")]
     return None
 
@@ -322,7 +324,10 @@ class _SamTemplate:
             host = code_dir / path
             sources = self._read(host)
             matches = _built_matches(sources, built, installed)
-            unmapped = "none of its source files are in the build (an editable install ships a link, not the files)"
+            unmapped = (
+                "none of its source files' bytes match anything the build installed "
+                "(e.g. an editable install ships a link, not the files)"
+            )
             if matches:
                 # A top-level module file has no package dir of its own to map.
                 modules = sorted("/".join(rel) for rel, _, tail in matches if tail == 1)
