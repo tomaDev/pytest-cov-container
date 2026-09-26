@@ -47,6 +47,16 @@ jobs:
         with:
           persist-credentials: false
 
+      # About 8s on a fresh runner; in the background they overlap the setup
+      # below instead of the first test. The images match sam_app's runtimes.
+      # A pull still running (or failed) when a test needs it is left to
+      # sam local, which pulls a missing image itself.
+      - name: Pull Lambda runtime images in the background
+        run: |
+          for image in python:3.14-x86_64 nodejs:22-x86_64; do
+            nohup docker pull -q "public.ecr.aws/lambda/$image" > /dev/null 2>&1 &
+          done
+
       - name: Install uv
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
@@ -64,14 +74,11 @@ jobs:
         with:
           use-installer: true
 
-      - name: TEMP time image pulls
-        run: |
-          time docker pull -q public.ecr.aws/lambda/python:3.14-x86_64
-          time docker pull -q public.ecr.aws/lambda/nodejs:22-x86_64
-
       # pytest's own args go after `--`: hatch test reads -r itself.
       # E2E_REQUIRED fails, not skips, when Docker or SAM is missing.
       - name: e2e suite
         env:
           E2E_REQUIRED: "1"
-        run: uvx hatch test --python 3.14 -- -m e2e -n 0 -rA --durations=0
+        run: |
+          docker image ls 'public.ecr.aws/lambda/*'  # TEMP: were the pulls done?
+          uvx hatch test --python 3.14 -- -m e2e -n 0 -rA --durations=0
