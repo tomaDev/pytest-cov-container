@@ -14,11 +14,14 @@ MADE_LAYER = "src/layers/made/src/made/greet.py"
 UV = "src/uv/app.py"
 PACKAGE = "src/libs/common/python/common/greet.py"
 _RUN_TIMEOUT_S = 900
+# SAM CLI sends telemetry before it exits: about 1s on every command.
+_NO_TELEMETRY = {"SAM_CLI_TELEMETRY": "0"}
 
 
 def run_pytest(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     """pytest with ``--cov`` in ``root``, isolated from this session's own pytest and coverage."""
     env = {k: v for k, v in os.environ.items() if not k.startswith(("PYTEST_", "COV_", "COVERAGE_"))}
+    env |= _NO_TELEMETRY
     return subprocess.run(
         [sys.executable, "-m", "pytest", "--cov=src", "--cov-report=", "-p", "no:randomly", *args],
         cwd=root,
@@ -74,5 +77,5 @@ def test_flush_of_warm_start_api_containers(app):
 def test_xdist_workers_each_receive_their_own_containers(app):
     # One invoke per worker: each branch arm is only covered when its
     # worker's sink received that worker's container push.
-    _passed(run_pytest(app, "tests/test_invoke.py", "-n", "2"))
+    _passed(run_pytest(app, "tests/test_invoke.py", "-n", "2", "-k", "sync"))
     assert {8, 9, 10, 12, 13} <= covered_lines(app)[SYNC]

@@ -47,6 +47,7 @@ def built_app(tmp_path_factory) -> Path:
     build = subprocess.run(
         ["sam", "build", "--beta-features"],
         cwd=root,
+        env=os.environ | {"SAM_CLI_TELEMETRY": "0"},
         capture_output=True,
         text=True,
         timeout=_BUILD_TIMEOUT_S,

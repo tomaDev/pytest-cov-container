@@ -11,6 +11,11 @@
   runs both before it builds, so nothing publishes unless they pass on Linux.
 - With `E2E_REQUIRED` set (CI), a missing Docker engine or SAM CLI fails the
   e2e suite instead of skipping it (`tests/e2e/conftest.py`).
+- **e2e suite about twice as fast** (47s to 23s locally): `sam local` calls
+  skip the registry check for the runtime image (`--skip-pull-image`; an
+  image not yet local is still pulled), SAM CLI telemetry is off for the
+  suite's commands, the start-api readiness poll is 0.25s, and the xdist
+  test runs only the two invokes it asserts on (`tests/e2e/`).
 - **Dependabot** (`.github/dependabot.yml`): weekly uv and GitHub Actions
   updates, patch and minor grouped per ecosystem. `dependabot-automerge.yaml`
   queues those to merge once CI passes; majors wait for a review.

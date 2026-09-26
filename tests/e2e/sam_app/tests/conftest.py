@@ -14,6 +14,10 @@ import pytest_cov_container
 
 # The first call of a runtime builds SAM's image for it.
 _SAM_TIMEOUT_S = 300
+# Each call otherwise asks the registry whether the runtime image is current
+# (about 1.6s). An image that is not local yet is still pulled.
+_SKIP_PULL = ("--skip-pull-image",)
+_POLL_S = 0.25
 
 
 def _env_file(root: Path, tmp_path: Path) -> Path:
@@ -32,7 +36,12 @@ def invoke(request, tmp_path):
         event_file = tmp_path / f"{function}-event.json"
         event_file.write_text(json.dumps(event))
         proc = subprocess.run(
-            ["sam", "local", "invoke", function, "--event", str(event_file), "--env-vars", str(env_file)],
+            [
+                "sam", "local", "invoke", function,
+                "--event", str(event_file),
+                "--env-vars", str(env_file),
+                *_SKIP_PULL,
+            ],
             cwd=root,
             capture_output=True,
             text=True,
@@ -70,6 +79,7 @@ def api(request, tmp_path):
             "--port", str(port),
             "--warm-containers", "EAGER",
             "--env-vars", str(_env_file(root, tmp_path)),
+            *_SKIP_PULL,
         ],
         cwd=root,
         stdout=log,
@@ -85,7 +95,7 @@ def api(request, tmp_path):
                 break
             except (urllib.error.URLError, ConnectionError):
                 assert time.monotonic() < deadline, (tmp_path / "start-api.log").read_text()
-                time.sleep(1)
+                time.sleep(_POLL_S)
         yield lambda path: _get(f"{url}{path}")
     finally:
         proc.terminate()
