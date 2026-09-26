@@ -35,9 +35,8 @@ repos:
       - id: hatch-test
         name: hatch test (default Python)
         language: system
-        # Last, so the cheap checks fail first. One Python per commit; the
-        # release script also runs the full matrix (`hatch test --all`)
-        # before it bumps.
+        # Last, so the cheap checks fail first. One Python per commit; CI
+        # runs every supported Python on pull requests and releases.
         entry: hatch test
         pass_filenames: false
         files: ^(src/|tests/|pyproject\.toml$)

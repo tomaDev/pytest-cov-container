@@ -9,8 +9,13 @@
   `ubuntu-26.04` runner, the first real run of the Linux `docker0` sink).
   `ci.yaml` runs both on pull requests; `release.yaml`
   runs both before it builds, so nothing publishes unless they pass on Linux.
-- With `E2E_REQUIRED` set (CI), a missing Docker engine or SAM CLI fails the
-  e2e suite instead of skipping it (`tests/e2e/conftest.py`).
+- A missing Docker engine or SAM CLI fails the e2e suite instead of
+  skipping it: the suite only runs when asked for (`-m e2e`), so a skip
+  would hide it (`tests/e2e/conftest.py`).
+- `hatch run release` no longer runs the unit matrix (`hatch test --all`);
+  `release.yaml` runs it in CI before anything publishes. The local e2e
+  run stays: only there does the Docker Desktop path run
+  (`scripts/release.py`).
 - **e2e suite about twice as fast** (47s to 23s locally): `sam local` calls
   skip the registry check for the runtime image (`--skip-pull-image`; an
   image not yet local is still pulled), SAM CLI telemetry is off for the

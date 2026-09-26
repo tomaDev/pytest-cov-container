@@ -2,8 +2,8 @@
 
 Each test runs pytest with ``--cov`` in a fresh copy of ``sam_app`` (a small
 SAM project whose tests invoke its functions), then reads the combined
-coverage data. Run with ``hatch test -m e2e``; skipped without Docker or SAM CLI,
-unless ``E2E_REQUIRED`` is set (CI), where a missing prerequisite fails instead.
+coverage data. Run with ``hatch test -m e2e``. Without Docker or SAM CLI the
+suite fails, not skips: it only runs when asked for, so a skip would hide it.
 """
 
 import os
@@ -27,20 +27,13 @@ def _available(*cmd: str) -> bool:
         return False
 
 
-def _unavailable(reason: str) -> None:
-    """Skip locally; fail in CI, where a skipped suite would pass green."""
-    if os.environ.get("E2E_REQUIRED"):
-        pytest.fail(reason)
-    pytest.skip(reason)
-
-
 @pytest.fixture(scope="session")
 def built_app(tmp_path_factory) -> Path:
     """``sam_app`` copied and built once per session."""
     if not _available("docker", "info"):
-        _unavailable("Docker engine not reachable")
+        pytest.fail("Docker engine not reachable")
     if not _available("sam", "--version"):
-        _unavailable("SAM CLI not installed")
+        pytest.fail("SAM CLI not installed")
     root = tmp_path_factory.mktemp("sam_app")
     shutil.copytree(APP, root, dirs_exist_ok=True, ignore=shutil.ignore_patterns(".aws-sam", "__pycache__"))
     # --beta-features: the `python-uv` build method is beta in SAM CLI.

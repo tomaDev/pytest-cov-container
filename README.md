@@ -146,7 +146,7 @@ prek install
 hatch test
 
 # Run the e2e suite: real `sam local` containers (needs Docker and SAM CLI;
-# skipped without them, unless E2E_REQUIRED is set, as in CI)
+# fails without them)
 hatch test -m e2e -n 0
 
 # Run across all Python versions

@@ -21,8 +21,9 @@ Workflow:
     1. Verify clean working tree on main (BEFORE any mutation).
     2. `git fetch origin main`, then fast-forward local main if behind.
        Refuses if origin/main has diverged.
-    3. Run `hatch test --all` (every supported Python), then the e2e suite
-       against real `sam local` containers; refuse on failure.
+    3. Run the e2e suite against real `sam local` containers on this
+       machine (Docker Desktop, which CI cannot run); refuse on failure.
+       The unit matrix runs in CI (release.yaml) before anything publishes.
     4. Bump __about__.py, commit "release X.Y.Z" (every pre-commit hook runs).
     5. Verify the resolved tag does not already exist locally or on origin.
     6. Push main.
@@ -169,14 +170,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"fast-forwarding {behind} commit(s) from origin/main")
         _mutate("git", "merge", "--ff-only", "origin/main", dry_run=dry_run)
 
-    # Every supported Python, BEFORE the bump: a failure leaves nothing to undo.
+    # Real `sam local` containers on this machine, BEFORE the bump: a failure
+    # leaves nothing to undo. CI covers the Linux engine and the unit matrix;
+    # only here does the Docker Desktop path run. Fails without Docker or SAM
+    # CLI. Serial (-n 0): concurrent runs would race SAM's image builds.
     # Read-only, so it runs under --dry-run too.
-    print("running the test matrix (hatch test --all)")
+    print("running the e2e suite (hatch test -m e2e)")
     try:
-        _run("hatch", "test", "--all")
-        # Then real `sam local` containers, once; needs Docker and SAM CLI.
-        # Serial (-n 0): concurrent runs would race SAM's image builds.
-        print("running the e2e suite (hatch test -m e2e)")
         _run("hatch", "test", "-m", "e2e", "-n", "0")
     except subprocess.CalledProcessError:
         print("error: tests failed; nothing was bumped", file=sys.stderr)
