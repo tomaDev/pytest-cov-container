@@ -255,11 +255,26 @@ _PACKAGE = {
 }
 
 
-class TestUvPathSources:
-    """A local package the function depends on is measured where ``sam build`` put it."""
+def _install(root, function: str, dist: str, files: dict[str, str]) -> None:
+    """``files`` installed into ``function``'s build dir as distribution ``dist``, with its RECORD."""
+    info = f"{dist.replace('-', '_')}-0.1.0.dist-info"
+    rows = [*files, f"{info}/METADATA", f"{info}/RECORD"]
+    _build_function(root, function, {**files, f"{info}/METADATA": "", f"{info}/RECORD": "".join(f"{r},,\n" for r in rows)})
 
-    def _uses(self, root, sources: str) -> None:
-        (root / "src/api/pyproject.toml").write_text(f"[project]\nname = 'api'\n\n[tool.uv.sources]\n{sources}")
+
+def _lock(root, sources: dict[str, str]) -> None:
+    """``src/api/uv.lock``: the project itself plus one package per ``name: source table``."""
+    text = 'version = 1\n\n[[package]]\nname = "api"\nversion = "0.1.0"\nsource = { virtual = "." }\n'
+    for name, source in sources.items():
+        text += f'\n[[package]]\nname = "{name}"\nversion = "0.1.0"\nsource = {source}\n'
+    (root / "src/api/uv.lock").write_text(text)
+
+
+_NET = "def get():\n    return 1\n"
+
+
+class TestUvLocalPackages:
+    """A local package in the function's uv.lock is measured where ``sam build`` installed it."""
 
     def _packages(self, root) -> tuple[SourceMapping, ...]:
         api = _targets(_load(root))["ApiFunction"]
@@ -267,59 +282,71 @@ class TestUvPathSources:
         assert api.mappings[:2] == (SourceMapping("src/api", "/var/task"), SourceMapping("src/shared", "/opt"))
         return api.mappings[2:]
 
-    def test_a_path_source_maps_each_top_level_package(self, sam_project):
+    def test_a_package_under_a_module_root_maps_by_its_package_dir(self, sam_project):
         _write(sam_project, _PACKAGE)
-        self._uses(sam_project, 'common = { path = "../common", editable = false }\n')
-        _build_function(
+        _lock(sam_project, {"common": '{ directory = "../common" }'})
+        _install(
             sam_project,
             "ApiFunction",
-            {
-                "app.py": "def f():\n    return 1\n",
-                "common/__init__.py": "",
-                "common/net.py": "def get():\n    return 1\n",
-                "common/sub/deep.py": "Z = 3\n",
-                # A dependency's empty __init__.py must not claim the package's.
-                "vendor/__init__.py": "",
-            },
+            "common",
+            {"common/__init__.py": "", "common/net.py": _NET, "common/sub/deep.py": "Z = 3\n"},
         )
         assert self._packages(sam_project) == (SourceMapping("src/common/python/common", "/var/task/common"),)
 
-    def test_a_flat_layout_package(self, sam_project):
-        _write(sam_project, {"src/lib/pyproject.toml": "", "src/lib/tool/run.py": "R = 1\n"})
-        self._uses(sam_project, 'tool = { path = "../lib" }\n')
-        _build_function(sam_project, "ApiFunction", {"tool/run.py": "R = 1\n"})
-        assert self._packages(sam_project) == (SourceMapping("src/lib/tool", "/var/task/tool"),)
-
-    def test_a_source_list_with_markers(self, sam_project):
+    def test_only_the_packages_recorded_files_are_matched(self, sam_project):
+        # A dependency's identical file outside the package's RECORD is never a candidate.
         _write(sam_project, _PACKAGE)
-        self._uses(sam_project, 'common = [{ path = "../common", marker = "sys_platform == \'linux\'" }]\n')
-        _build_function(sam_project, "ApiFunction", {"common/net.py": "def get():\n    return 1\n"})
+        _lock(sam_project, {"common": '{ directory = "../common" }'})
+        _install(sam_project, "ApiFunction", "common", {"common/net.py": _NET})
+        _build_function(sam_project, "ApiFunction", {"a_vendor/common/net.py": _NET})
         assert self._packages(sam_project) == (SourceMapping("src/common/python/common", "/var/task/common"),)
 
-    def test_other_sources_are_not_packages_here(self, sam_project):
-        _write(sam_project, {"src/wheels/pkg-1.0-py3-none-any.whl": ""})
-        self._uses(
+    def test_a_flat_layout_package_and_a_transitive_one(self, sam_project):
+        # The lock lists every local package the function resolved, not only its direct ones.
+        _write(sam_project, _PACKAGE | {"src/lib/pyproject.toml": "", "src/lib/tool/run.py": "R = 1\n"})
+        _lock(sam_project, {"common": '{ directory = "../common" }', "tool": '{ directory = "../lib" }'})
+        _install(sam_project, "ApiFunction", "common", {"common/net.py": _NET})
+        _install(sam_project, "ApiFunction", "tool", {"tool/run.py": "R = 1\n"})
+        assert set(self._packages(sam_project)) == {
+            SourceMapping("src/common/python/common", "/var/task/common"),
+            SourceMapping("src/lib/tool", "/var/task/tool"),
+        }
+
+    def test_registry_and_project_sources_are_not_local_packages(self, sam_project):
+        _lock(
             sam_project,
-            'a = { git = "https://example.com/a.git" }\nb = { index = "internal" }\nc = { workspace = true }\n'
-            'd = { url = "https://example.com/d.whl" }\ne = { path = "../wheels/pkg-1.0-py3-none-any.whl" }\n'
-            'f = { path = "../missing" }\n',
+            {"httpx": '{ registry = "https://pypi.org/simple" }', "gone": '{ directory = "../missing" }'},
         )
         _build_function(sam_project, "ApiFunction", {"app.py": "def f():\n    return 1\n"})
         assert self._packages(sam_project) == ()
 
-    def test_a_package_changed_since_the_build_is_not_matched(self, sam_project):
-        # e.g. an editable install: the build holds a link, not the files.
+    def test_a_locked_package_the_build_did_not_install_is_skipped_quietly(self, sam_project):
+        # e.g. a local package in a dev group: locked, never shipped.
         _write(sam_project, _PACKAGE)
-        self._uses(sam_project, 'common = { path = "../common" }\n')
-        _build_function(sam_project, "ApiFunction", {"common/net.py": "def get():\n    return 2\n"})
-        with pytest.warns(UserWarning, match=r"ApiFunction: none of \.\./common's source files"):
+        _lock(sam_project, {"common": '{ directory = "../common" }'})
+        _build_function(sam_project, "ApiFunction", {"app.py": "def f():\n    return 1\n"})
+        assert self._packages(sam_project) == ()
+
+    def test_an_editable_install_warns(self, sam_project):
+        # The build holds a link to the checkout, not the files.
+        _write(sam_project, _PACKAGE)
+        _lock(sam_project, {"common": '{ editable = "../common" }'})
+        _install(sam_project, "ApiFunction", "common", {})
+        with pytest.warns(UserWarning, match=r"ApiFunction: common \(\.\./common\) is installed but not measured"):
+            assert self._packages(sam_project) == ()
+
+    def test_a_top_level_module_file_warns(self, sam_project):
+        _write(sam_project, {"src/one/pyproject.toml": "", "src/one/single.py": "S = 1\n"})
+        _lock(sam_project, {"single": '{ directory = "../one" }'})
+        _install(sam_project, "ApiFunction", "single", {"single.py": "S = 1\n"})
+        with pytest.warns(UserWarning, match=r"top-level module files \['single\.py'\]"):
             assert self._packages(sam_project) == ()
 
     def test_before_a_build_packages_are_skipped_quietly(self, sam_project):
         _write(sam_project, _PACKAGE)
-        self._uses(sam_project, 'common = { path = "../common" }\n')
+        _lock(sam_project, {"common": '{ directory = "../common" }'})
         assert self._packages(sam_project) == ()
 
-    def test_a_function_without_a_pyproject_has_no_packages(self, sam_project):
+    def test_a_function_without_a_lock_has_no_packages(self, sam_project):
         _build_function(sam_project, "ApiFunction", {"app.py": "def f():\n    return 1\n"})
         assert self._packages(sam_project) == ()

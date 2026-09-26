@@ -7,6 +7,7 @@ recognised. Any key the project sets explicitly wins. One framework is
 supported today; the next consumer gets its own preset.
 """
 
+import re
 import tomllib
 import warnings
 from collections.abc import Mapping
@@ -109,69 +110,98 @@ def _common_tail(a: tuple[str, ...], b: tuple[str, ...]) -> int:
     return n
 
 
-def _built_matches(source: Path, built: Path) -> list[tuple[tuple[str, ...], tuple[str, ...], int]]:
-    """Where ``sam build`` put each of ``source``'s files in ``built``.
+def _read_sources(source: Path) -> list[tuple[tuple[str, ...], bytes]]:
+    """Each measured file under ``source``: its path parts, relative to ``source``, and its bytes."""
+    return [(rel.parts, (source / rel).read_bytes()) for rel in source_files(source)]
+
+
+def _built_matches(
+    sources: list[tuple[tuple[str, ...], bytes]], built: Path, candidates: list[Path] | None = None
+) -> list[tuple[tuple[str, ...], tuple[str, ...], int]]:
+    """Where ``sam build`` put each of the ``sources`` files in ``built``.
 
     ``(source path, built path, common tail)`` per matched file: the built file
     with the same bytes and the longest common path tail (a vendored
-    dependency may share its name).
+    dependency may share its name). ``candidates`` (paths relative to
+    ``built``) narrows the search; by default every ``*.py`` in ``built``.
     """
     by_name: dict[str, list[Path]] = {}
-    for path in built.rglob("*.py"):
-        by_name.setdefault(path.name, []).append(path.relative_to(built))
+    for path in candidates if candidates is not None else (p.relative_to(built) for p in built.rglob("*.py")):
+        by_name.setdefault(path.name, []).append(path)
     matches = []
-    for rel in source_files(source):
+    for rel, content in sources:
         # Longest tail first, so a common name (``__init__.py``) reads few files.
-        candidates = sorted((-_common_tail(rel.parts, c.parts), c) for c in by_name.get(rel.name, ()))
-        content = (source / rel).read_bytes()
-        for negative_tail, candidate in candidates:
+        ranked = sorted((-_common_tail(rel, c.parts), c) for c in by_name.get(rel[-1], ()))
+        for negative_tail, candidate in ranked:
             if (built / candidate).read_bytes() == content:
-                matches.append((rel.parts, candidate.parts, -negative_tail))
+                matches.append((rel, candidate.parts, -negative_tail))
                 break
     return matches
 
 
-def _built_layout(source: Path, built: Path) -> list[tuple[tuple[str, ...], tuple[str, ...]]] | None:
+def _built_layout(sources: list[tuple[tuple[str, ...], bytes]], built: Path) -> list[tuple[tuple[str, ...], tuple[str, ...]]] | None:
     """How ``sam build`` placed ``source``'s files in ``built``: ``(source subdir, built subdir)`` pairs.
 
     What precedes each matched file's common tail on each side is the pair.
     None when no source file is in the build.
     """
-    pairs = {(rel[:-tail], candidate[:-tail]) for rel, candidate, tail in _built_matches(source, built)}
+    matches = _built_matches(sources, built)
+    pairs = {(rel[:-tail], candidate[:-tail]) for rel, candidate, tail in matches}
     return sorted(pairs) or None
 
 
-def _built_packages(source: Path, built: Path) -> list[tuple[tuple[str, ...], tuple[str, ...]]] | None:
-    """Each top-level package of ``source`` and its dir in ``built``: ``(source dir, built dir)`` pairs.
+def _package_dirs(matches: list[tuple[tuple[str, ...], tuple[str, ...], int]]) -> list[tuple[tuple[str, ...], tuple[str, ...]]]:
+    """Each top-level package dir the ``matches`` fall in: ``(source dir, built dir)`` pairs.
 
     Unlike a layer's layout, a package shares ``/var/task`` with the function's
     code, so it maps by its own package dirs, never by the build root.
     """
-    matches = _built_matches(source, built)
-    pairs = {
-        (rel[: len(rel) - tail + 1], candidate[: len(candidate) - tail + 1])
-        for rel, candidate, tail in matches
-        # A module file at the top of the build has no package dir of its own.
-        if tail > 1
-    }
-    return sorted(pairs) if matches else None
+    return sorted(
+        {
+            (rel[: len(rel) - tail + 1], candidate[: len(candidate) - tail + 1])
+            for rel, candidate, tail in matches
+            # A module file at the top of the build has no package dir of its own.
+            if tail > 1
+        }
+    )
 
 
-def _path_sources(code_dir: Path) -> list[str]:
-    """The local directories ``code_dir``'s uv project depends on (``[tool.uv.sources]`` ``path``), as written."""
-    pyproject = code_dir / "pyproject.toml"
-    if not pyproject.is_file():
+def _local_packages(code_dir: Path) -> list[tuple[str, str]]:
+    """``(name, source dir as written)`` of each local package in ``code_dir``'s ``uv.lock``.
+
+    The lock lists every package the function resolved, direct or not, with
+    ``source = { directory = "..." }`` (or ``editable``) for a local one; the
+    project itself (``"."``) is its own code.
+    """
+    lock = code_dir / "uv.lock"
+    if not lock.is_file():
         return []
-    with pyproject.open("rb") as f:
-        sources = tomllib.load(f).get("tool", {}).get("uv", {}).get("sources", {})
-    paths = []
-    for spec in sources.values():
-        # One source, or a list of sources with markers.
-        for entry in spec if isinstance(spec, list) else [spec]:
-            path = entry.get("path") if isinstance(entry, Mapping) else None
-            if isinstance(path, str) and (code_dir / path).is_dir() and path not in paths:
-                paths.append(path)
-    return paths
+    with lock.open("rb") as f:
+        packages = tomllib.load(f).get("package", [])
+    local = []
+    for package in packages:
+        source = package.get("source") or {}
+        path = source.get("directory") or source.get("editable")
+        if isinstance(path, str) and path != "." and (code_dir / path).is_dir():
+            local.append((package["name"], path))
+    return local
+
+
+def _normalized(name: str) -> str:
+    return re.sub(r"[-_.]+", "_", name).lower()
+
+
+def _installed_files(built: Path, name: str) -> list[Path] | None:
+    """The ``*.py`` files the build installed for distribution ``name`` (its ``RECORD``), or None if not installed."""
+    for info in built.glob("*.dist-info"):
+        if _normalized(info.name.removesuffix(".dist-info").rpartition("-")[0]) != _normalized(name):
+            continue
+        record = info / "RECORD"
+        if not record.is_file():
+            return []
+        rows = (line.split(",", 1)[0] for line in record.read_text().splitlines())
+        return [Path(row) for row in rows if row.endswith(".py") and not row.startswith("..")]
+    return None
 
 
 def _layer_root(layer: Mapping[str, Any]) -> str:
@@ -194,6 +224,8 @@ class _SamTemplate:
         self.resources: Mapping[str, Any] = template.get("Resources") or {}
         self.globals: Mapping[str, Any] = (template.get("Globals") or {}).get("Function") or {}
         self.build_root = rootpath / build_root
+        # Every function that uses a package or layer reads the same sources.
+        self._sources: dict[Path, list[tuple[tuple[str, ...], bytes]]] = {}
         built_template = self.build_root / "template.yaml"
         # ``sam build``'s own template: where it put each function and layer.
         self.built: Mapping[str, Any] = {}
@@ -252,7 +284,7 @@ class _SamTemplate:
         host = Path(source) if Path(source).is_absolute() else self.rootpath / source
         if built is None or not built.is_dir() or not host.is_dir():
             return fallback
-        layout = _built_layout(host, built)
+        layout = _built_layout(self._read(host), built)
         if layout is None:
             if source_files(host):
                 warnings.warn(
@@ -264,12 +296,18 @@ class _SamTemplate:
             return fallback
         return [SourceMapping(_join(source, host_sub), _join(_SAM_LAYER_ROOT, built_sub)) for host_sub, built_sub in layout]
 
-    def _package_mappings(self, name: str, code: str) -> list[SourceMapping]:
-        """The local packages the function's uv project depends on, where ``sam build`` put them.
+    def _read(self, source: Path) -> list[tuple[tuple[str, ...], bytes]]:
+        if source not in self._sources:
+            self._sources[source] = _read_sources(source)
+        return self._sources[source]
 
-        ``python-uv`` installs a ``path`` source into the function's build dir
-        like any dependency, so its files sit under ``/var/task``; before a
-        build there is nowhere to read that from, and nothing to measure.
+    def _package_mappings(self, name: str, code: str) -> list[SourceMapping]:
+        """The local packages in the function's ``uv.lock``, where ``sam build`` installed them.
+
+        ``python-uv`` installs a local package into the function's build dir
+        like any dependency, so its files sit under ``/var/task``; the
+        package's ``RECORD`` lists them. Before a build there is nowhere to
+        read that from, and nothing to measure.
         """
         built_uri = self.built_uri(name, "CodeUri")
         built = self.build_root / built_uri if built_uri else None
@@ -277,22 +315,28 @@ class _SamTemplate:
             return []
         code_dir = Path(code) if Path(code).is_absolute() else self.rootpath / code
         mappings = []
-        for path in _path_sources(code_dir):
-            host = code_dir / path
-            source = _relative_to_root(host, self.rootpath)
-            packages = _built_packages(host, built)
-            if packages is None:
-                if source_files(host):
-                    warnings.warn(
-                        f"pytest-cov-container: {name}: none of {path}'s source files are in its build output "
-                        f"{built}; not measuring it (an editable install ships a link, not the files)",
-                        UserWarning,
-                        stacklevel=2,
-                    )
+        for package, path in _local_packages(code_dir):
+            installed = _installed_files(built, package)
+            if installed is None:  # locked but not shipped, e.g. a dev-group package
                 continue
+            host = code_dir / path
+            sources = self._read(host)
+            matches = _built_matches(sources, built, installed)
+            unmapped = "none of its source files are in the build (an editable install ships a link, not the files)"
+            if matches:
+                # A top-level module file has no package dir of its own to map.
+                modules = sorted("/".join(rel) for rel, _, tail in matches if tail == 1)
+                unmapped = f"top-level module files {modules} have no package dir to map" if modules else ""
+            if unmapped and sources:
+                warnings.warn(
+                    f"pytest-cov-container: {name}: {package} ({path}) is installed but not measured: {unmapped}",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            source = _relative_to_root(host, self.rootpath)
             mappings.extend(
                 SourceMapping(_join(source, host_dir), _join(_SAM_TASK_ROOT, built_dir))
-                for host_dir, built_dir in packages
+                for host_dir, built_dir in _package_dirs(matches)
             )
         return mappings
 

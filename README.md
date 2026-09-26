@@ -39,7 +39,7 @@ For `framework = "aws-sam"` the preset reads `template.yaml`:
 |-----|-------------|
 | functions | every zip Python function with a local `CodeUri`, whatever builds it (pip, `python-uv`, `makefile`), or the `functions` list |
 | build dir | from `sam build`'s own template (`.aws-sam/build/<dir>`; functions that share code share one), else `.aws-sam/build/<logical id>` |
-| sources | the function's `CodeUri` at `/var/task`; each local layer's `ContentUri` where `sam build` put its files under `/opt`, whatever built it (`python3.x`, `makefile`, none); before a build, by its `BuildMethod` (Globals and function `Layers`); and each local package in the function's `[tool.uv.sources]` (`path = ...`) where `sam build` installed it under `/var/task`, whatever its layout (`src/`, flat, a `module-root`). Needs a build; an editable source ships a link, not the files, and is not measured (a warning says so) |
+| sources | the function's `CodeUri` at `/var/task`; each local layer's `ContentUri` where `sam build` put its files under `/opt`, whatever built it (`python3.x`, `makefile`, none); before a build, by its `BuildMethod` (Globals and function `Layers`); and each local package in the function's `uv.lock` (`source = { directory = ... }`, direct or transitive) where `sam build` installed it under `/var/task` (its `RECORD`), whatever its layout (`src/`, flat, a `module-root`). Needs a build; an editable install ships a link, not the files, and a top-level module file has no package dir to map: both are not measured, and a warning says so |
 | `label` | `sam.cli.container.type=lambda` (set by SAM CLI 1.165+ on every Lambda container) |
 | `mount_prefix` | the build root: only this checkout's containers |
 

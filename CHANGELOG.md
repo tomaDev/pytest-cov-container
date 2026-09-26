@@ -4,14 +4,17 @@
 
 ### Added
 
-- **Local uv packages are measured.** A function that depends on a local
-  package through a `[tool.uv.sources]` `path` entry gets that package
-  installed into its build dir, under `/var/task`, by the `python-uv` build.
-  The preset now finds each of the package's source files in the function's
-  build output and maps its top-level package dirs back to their sources, so a
-  code-sharing package replaces a layer without losing its coverage. It warns
-  when the build holds none of the package's files, e.g. an editable source
-  (`frameworks.py`).
+- **Local uv packages are measured.** The `python-uv` build installs each
+  local package in a function's `uv.lock` (`source = { directory = ... }`,
+  direct or transitive) into the function's build dir, under `/var/task`.
+  The preset now reads the lock, finds each package's installed files in its
+  `RECORD`, matches them to the package's sources and maps its top-level
+  package dirs back to them, so a code-sharing package replaces a layer
+  without losing its coverage. It warns when an installed package cannot be
+  mapped: an editable install (the build holds a link, not the files) or a
+  top-level module file (`frameworks.py`).
+- Source files shared by several functions (a layer, a package) are read
+  once per configuration, not once per function (`frameworks.py`).
 
 ### Fixed
 
