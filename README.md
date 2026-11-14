@@ -39,7 +39,7 @@ For `framework = "aws-sam"` the preset reads `template.yaml`:
 |-----|-------------|
 | functions | every zip Python function with a local `CodeUri`, whatever builds it (pip, `python-uv`, `makefile`), or the `functions` list |
 | build dir | from `sam build`'s own template (`.aws-sam/build/<dir>`; functions that share code share one), else `.aws-sam/build/<logical id>` |
-| sources | the function's `CodeUri` at `/var/task`; each local layer's `ContentUri` where `sam build` put its files under `/opt`, whatever built it (`python3.x`, `makefile`, none); before a build, by its `BuildMethod` (Globals and function `Layers`); and each local package in the function's `uv.lock` (`source = { directory = ... }`, direct or transitive) where `sam build` installed it under `/var/task` (its `RECORD`), whatever its layout (`src/`, flat, a `module-root`). Needs a build; an editable install ships a link, not the files, and a top-level module file has no package dir to map: both are not measured, and a warning says so |
+| sources | the function's `CodeUri` at `/var/task`; each local layer's `ContentUri` where `sam build` put its files under `/opt`, whatever built it (`python3.x`, `makefile`, none); before a build, by its `BuildMethod` (Globals and function `Layers`); and each local package in the function's `uv.lock` (`source = { directory = ... }`, direct or transitive) where `sam build` installed it under `/var/task` (its `RECORD`), whatever its layout (`src/`, flat, a `module-root`). Needs a build. A package the build installed but none of whose files match its sources (an editable install ships a link, not the files; or a build older than the sources) fails the run at startup; see `strict`. A top-level module file has no package dir to map: it is not measured, and a warning says so |
 | `label` | `sam.cli.container.type=lambda` (set by SAM CLI 1.165+ on every Lambda container) |
 | `mount_prefix` | the build root: only this checkout's containers |
 
@@ -57,6 +57,7 @@ For `framework = "aws-sam"` the preset reads `template.yaml`:
 | `sink_host` | Address containers use to reach the sink (default: detected, see below) |
 | `sink_bind` | Address the sink listens on (default: detected, see below) |
 | `docker_network` | The docker network the containers join, for that detection (default: `bridge`) |
+| `strict` | `aws-sam`: fail at startup when the build ships a local package or layer whose source files match nothing in it, so its lines would silently drop out of coverage (default: `true`; `false` only warns) |
 | `required` | Fail when a process that flushed containers received no coverage (default: `false`; also `--cov-container-required`) |
 | `enabled` | Set to `false` to disable (default: `true`) |
 

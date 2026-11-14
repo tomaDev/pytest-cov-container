@@ -1,7 +1,7 @@
 import pytest
 
 from pytest_cov_container import config
-from pytest_cov_container.frameworks import SourceMapping
+from pytest_cov_container.frameworks import SourceMapping, UnmeasuredSourceError
 
 
 def _load(root, toml: str = "") -> config.PluginConfig:
@@ -220,10 +220,18 @@ class TestLayerLayoutFromTheBuild:
         )
         assert self._shared(sam_project) == (SourceMapping("src/shared", "/opt/python"),)
 
-    def test_no_source_file_in_the_build_warns_and_falls_back(self, sam_project):
+    def test_no_source_file_in_the_build_fails(self, sam_project):
         _build_layer(sam_project, {"python/other.py": "Y = 2\n"})
-        with pytest.warns(UserWarning, match="SharedLayer: none of its source files"):
-            assert self._shared(sam_project) == (SourceMapping("src/shared", "/opt"),)
+        match = r"SharedLayer \(src/shared\): none of its source files"
+        with pytest.raises(UnmeasuredSourceError, match=match) as raised:
+            self._shared(sam_project)
+        assert "assuming" not in str(raised.value)
+
+    def test_no_source_file_in_the_build_only_warns_when_not_strict(self, sam_project):
+        _build_layer(sam_project, {"python/other.py": "Y = 2\n"})
+        with pytest.warns(UserWarning, match=r"SharedLayer \(src/shared\): none of its .* assuming they sit at /opt"):
+            api = _targets(_load(sam_project, "strict = false\n"))["ApiFunction"]
+        assert api.mappings[1:] == (SourceMapping("src/shared", "/opt"),)
 
 
 def _build_function(root, function: str, files: dict[str, str]) -> None:
@@ -276,8 +284,8 @@ _NET = "def get():\n    return 1\n"
 class TestUvLocalPackages:
     """A local package in the function's uv.lock is measured where ``sam build`` installed it."""
 
-    def _packages(self, root) -> tuple[SourceMapping, ...]:
-        api = _targets(_load(root))["ApiFunction"]
+    def _packages(self, root, toml: str = "") -> tuple[SourceMapping, ...]:
+        api = _targets(_load(root, toml))["ApiFunction"]
         # The code at /var/task and the Globals layer come first.
         assert api.mappings[:2] == (SourceMapping("src/api", "/var/task"), SourceMapping("src/shared", "/opt"))
         return api.mappings[2:]
@@ -327,15 +335,50 @@ class TestUvLocalPackages:
         _build_function(sam_project, "ApiFunction", {"app.py": "def f():\n    return 1\n"})
         assert self._packages(sam_project) == ()
 
-    def test_an_editable_install_warns(self, sam_project):
-        # The build holds a link to the checkout, not the files.
+    def test_an_editable_install_fails(self, sam_project):
+        # The build holds a link to the checkout (a .pth), not the files.
         _write(sam_project, _PACKAGE)
         _lock(sam_project, {"common": '{ editable = "../common" }'})
-        _install(sam_project, "ApiFunction", "common", {})
-        with pytest.warns(UserWarning, match=r"ApiFunction: common \(\.\./common\) is installed but not measured"):
-            assert self._packages(sam_project) == ()
+        _install(sam_project, "ApiFunction", "common", {"_common.pth": "/checkout/src/common/python\n"})
+        with pytest.raises(UnmeasuredSourceError) as raised:
+            self._packages(sam_project)
+        message = str(raised.value)
+        assert "ApiFunction: common (../common) is installed but not measured" in message
+        assert "none of its source files' bytes match anything the build installed" in message
+        assert "editable = false in [tool.uv.sources], or uv export --no-editable" in message
+        assert "set strict = false" in message
 
-    def test_a_top_level_module_file_warns(self, sam_project):
+    def test_installed_files_that_differ_from_the_sources_fail(self, sam_project):
+        # e.g. a build older than the package's sources.
+        _write(sam_project, _PACKAGE)
+        _lock(sam_project, {"common": '{ directory = "../common" }'})
+        _install(sam_project, "ApiFunction", "common", {"common/net.py": "def get():\n    return 0\n"})
+        with pytest.raises(UnmeasuredSourceError, match=r"ApiFunction: common \(\.\./common\) is installed but not"):
+            self._packages(sam_project)
+
+    def test_an_unmapped_package_only_warns_when_not_strict(self, sam_project):
+        _write(sam_project, _PACKAGE)
+        _lock(sam_project, {"common": '{ editable = "../common" }'})
+        _install(sam_project, "ApiFunction", "common", {"_common.pth": "/checkout/src/common/python\n"})
+        with pytest.warns(UserWarning, match=r"ApiFunction: common \(\.\./common\) is installed but not measured"):
+            assert self._packages(sam_project, "strict = false\n") == ()
+
+    @pytest.mark.parametrize("toml", ["enabled = false\n", ""])
+    def test_an_unmapped_package_only_warns_when_not_measuring(self, sam_project, toml):
+        # A disabled plugin, or a public helper with the plugin inactive: nothing is measured.
+        _write(sam_project, _PACKAGE)
+        _lock(sam_project, {"common": '{ editable = "../common" }'})
+        _install(sam_project, "ApiFunction", "common", {"_common.pth": "/checkout/src/common/python\n"})
+        (sam_project / "pyproject.toml").write_text('[tool.pytest-cov-container]\nframework = "aws-sam"\n' + toml)
+        with pytest.warns(UserWarning, match=r"ApiFunction: common \(\.\./common\) is installed but not measured"):
+            assert config.load_config(sam_project / "pyproject.toml", measuring=bool(toml)) is not None
+
+    def test_strict_must_be_a_bool(self, sam_project):
+        with pytest.raises(ValueError, match="strict must be true or false"):
+            _load(sam_project, 'strict = "no"\n')
+
+    def test_a_top_level_module_file_only_warns(self, sam_project):
+        # A packaging-shape limit, not a misconfiguration: it warns even when strict.
         _write(sam_project, {"src/one/pyproject.toml": "", "src/one/single.py": "S = 1\n"})
         _lock(sam_project, {"single": '{ directory = "../one" }'})
         _install(sam_project, "ApiFunction", "single", {"single.py": "S = 1\n"})

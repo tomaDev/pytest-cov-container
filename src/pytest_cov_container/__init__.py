@@ -83,7 +83,8 @@ def collect_container_coverage() -> int:
 
 
 def _load(rootpath: Path) -> "_config.PluginConfig | None":
-    return _config.load_config(rootpath / "pyproject.toml")
+    # The plugin is inactive here, or its own config is already loaded: never fail on what it would measure.
+    return _config.load_config(rootpath / "pyproject.toml", measuring=False)
 
 
 def container_env(rootpath: Path) -> dict[str, str]:

@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### Changed
+
+- **An installed local package that cannot be mapped fails the run.** When
+  the build installed a package from the function's `uv.lock` (its
+  `*.dist-info` and `RECORD` are there) but none of its source files match
+  anything installed, the preset now raises at config load instead of
+  warning: pytest exits with a usage error naming the function, the package,
+  its source path, the reason, and the fix (ship it non-editable:
+  `editable = false` in `[tool.uv.sources]`, or `uv export --no-editable`;
+  or rerun `sam build`). The usual cause is an editable install, which ships
+  a `.pth`, not the files; a suite without `filterwarnings = error` passed the
+  warning over and lost the package's lines from coverage.
+  A local layer whose source files are in none of its build output fails the
+  same way, rather than being assumed to sit at `/opt`.
+  `strict = false` in `[tool.pytest-cov-container]` restores the warnings,
+  and so does a run that measures nothing: `enabled = false`, or
+  `container_env()` / `owned_containers()` with the plugin inactive
+  (`config.py`, `__init__.py`). Any `[tool.pytest-cov-container]` value error
+  at startup is now a usage error, not an INTERNALERROR traceback.
+  Unchanged: a locked package the build did not install (e.g. a dev group)
+  is skipped quietly; before a build nothing is read; a top-level module file
+  with no package dir to map still only warns (`frameworks.py`, `plugin.py`).
+
 ### Internal
 
 - **CI on Linux.** A reusable `tests.yaml` runs the unit suite on every

@@ -47,7 +47,13 @@ def _optional_bool(section: dict, key: str) -> bool | None:
     raise ValueError(msg)
 
 
-def load_config(pyproject_path: Path) -> PluginConfig | None:
+def load_config(pyproject_path: Path, *, measuring: bool = True) -> PluginConfig | None:
+    """The ``[tool.pytest-cov-container]`` config, or None without one.
+
+    ``measuring`` false (the public helpers with the plugin inactive) never
+    fails on a source the preset cannot map: nothing is measured, so the
+    ``strict`` failure would only break a run without coverage. It warns instead.
+    """
     if not pyproject_path.exists():
         return None
 
@@ -59,14 +65,16 @@ def load_config(pyproject_path: Path) -> PluginConfig | None:
         return None
 
     framework = tool_config.get("framework")
+    enabled = tool_config.get("enabled", True)
+    strict = _optional_bool(tool_config, "strict") is not False
     # The framework's defaults; every key set explicitly below wins over them.
-    preset = frameworks.defaults(framework, tool_config, pyproject_path.parent)
+    preset = frameworks.defaults(framework, tool_config, pyproject_path.parent, strict=strict and measuring and enabled)
     return PluginConfig(
         framework=framework,
         targets=preset.targets,
         image_pattern=tool_config.get("image_pattern"),
         label=tool_config.get("label", preset.label),
-        enabled=tool_config.get("enabled", True),
+        enabled=enabled,
         mount_prefix=tool_config.get("mount_prefix", preset.mount_prefix),
         worker_env=tool_config.get("worker_env"),
         required=bool(_optional_bool(tool_config, "required")),

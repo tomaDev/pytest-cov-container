@@ -341,7 +341,12 @@ def pytest_configure(config):
     if not cov_sources or config.getoption("--no-cov", default=False):
         return
 
-    plugin_config = config_module.load_config(config.rootpath / "pyproject.toml")
+    try:
+        plugin_config = config_module.load_config(config.rootpath / "pyproject.toml")
+    except ValueError as exc:
+        # A config error (an unmapped source, a bad `strict`) prints as one line and exits 4,
+        # not as an INTERNALERROR traceback.
+        raise pytest.UsageError(str(exc)) from exc
     if plugin_config is None or not plugin_config.enabled:
         return
 

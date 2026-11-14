@@ -27,6 +27,15 @@ _SAM_LAYER_ROOT = "/opt"
 _SOURCE_SKIP_DIRS = frozenset({"__pycache__", "tests"})
 
 
+class UnmeasuredSourceError(ValueError):
+    """The build ships a local source the preset cannot map, so its lines would drop out of coverage.
+
+    Raised at config load (``strict``, the default), where the plugin reports
+    it as a usage error; with ``strict = false`` it is a warning, which a run
+    without ``filterwarnings = error`` passes over.
+    """
+
+
 @dataclass(frozen=True)
 class SourceMapping:
     """A host source directory and where the container sees its files."""
@@ -219,9 +228,10 @@ def _layer_root(layer: Mapping[str, Any]) -> str:
 
 
 class _SamTemplate:
-    def __init__(self, path: Path, rootpath: Path, build_root: str):
+    def __init__(self, path: Path, rootpath: Path, build_root: str, *, strict: bool = True):
         self.path = path
         self.rootpath = rootpath
+        self.strict = strict
         template = _load_template(path)
         self.resources: Mapping[str, Any] = template.get("Resources") or {}
         self.globals: Mapping[str, Any] = (template.get("Globals") or {}).get("Function") or {}
@@ -240,6 +250,14 @@ class _SamTemplate:
 
     def _prop(self, properties: Mapping[str, Any], key: str) -> Any:
         return properties.get(key, self.globals.get(key))
+
+    def _unmeasured(self, problem: str, fix: str, fallback: str = "") -> None:
+        """A source the build ships but no mapping covers: fail when ``strict``, else warn (with the ``fallback``)."""
+        message = f"pytest-cov-container: {problem}"
+        if self.strict:
+            msg = f"{message}. Fix: {fix}. To only warn, set strict = false in [tool.pytest-cov-container]"
+            raise UnmeasuredSourceError(msg)
+        warnings.warn(f"{message}{fallback}", UserWarning, stacklevel=3)
 
     def _source(self, uri: str) -> str:
         return _relative_to_root(self.path.parent / uri, self.rootpath)
@@ -289,11 +307,11 @@ class _SamTemplate:
         layout = _built_layout(self._read(host), built)
         if layout is None:
             if source_files(host):
-                warnings.warn(
-                    f"pytest-cov-container: {name}: none of its source files are in its build output {built}; "
-                    f"assuming they sit at {fallback[0].container_dir}",
-                    UserWarning,
-                    stacklevel=2,
+                self._unmeasured(
+                    f"{name} ({source}): none of its source files are in its build output {built}",
+                    "build the layer so it ships its source files as they are, then run 'sam build' "
+                    "(a build older than the sources holds other bytes)",
+                    f"; assuming they sit at {fallback[0].container_dir}",
                 )
             return fallback
         return [SourceMapping(_join(source, host_sub), _join(_SAM_LAYER_ROOT, built_sub)) for host_sub, built_sub in layout]
@@ -324,17 +342,20 @@ class _SamTemplate:
             host = code_dir / path
             sources = self._read(host)
             matches = _built_matches(sources, built, installed)
-            unmapped = (
-                "none of its source files' bytes match anything the build installed "
-                "(e.g. an editable install ships a link, not the files)"
-            )
-            if matches:
-                # A top-level module file has no package dir of its own to map.
-                modules = sorted("/".join(rel) for rel, _, tail in matches if tail == 1)
-                unmapped = f"top-level module files {modules} have no package dir to map" if modules else ""
-            if unmapped and sources:
+            unmeasured = f"{name}: {package} ({path}) is installed but not measured"
+            if sources and not matches:
+                self._unmeasured(
+                    f"{unmeasured}: none of its source files' bytes match anything the build installed "
+                    "(e.g. an editable install ships a link, not the files)",
+                    "ship it non-editable: editable = false in [tool.uv.sources], or uv export --no-editable; "
+                    "a build older than the sources: run 'sam build'",
+                )
+            # A top-level module file has no package dir of its own to map: a
+            # packaging-shape limit, not a misconfiguration, so it only warns.
+            modules = sorted("/".join(rel) for rel, _, tail in matches if tail == 1)
+            if modules:
                 warnings.warn(
-                    f"pytest-cov-container: {name}: {package} ({path}) is installed but not measured: {unmapped}",
+                    f"pytest-cov-container: {unmeasured}: top-level module files {modules} have no package dir to map",
                     UserWarning,
                     stacklevel=2,
                 )
@@ -383,17 +404,19 @@ def _targets(template: _SamTemplate, names: list[str], build_root: str) -> tuple
     return tuple(targets)
 
 
-def aws_sam(tool_config: Mapping[str, Any], rootpath: Path) -> FrameworkDefaults:
+def aws_sam(tool_config: Mapping[str, Any], rootpath: Path, *, strict: bool = True) -> FrameworkDefaults:
     """``sam local``: every zip Python function in the template, or ``functions``.
 
     Reads ``template.yaml`` at rootdir (``template`` overrides). Each function
     is measured from its dir under the build root (``build_dir``, default
     ``.aws-sam/build``; the built template names the dir) with its ``CodeUri``
     mounted at ``/var/task`` and its local layers where ``sam build`` put
-    them under ``/opt``.
+    them under ``/opt``. ``strict`` fails when the build ships a local package
+    or layer whose sources match nothing in it; otherwise that only warns.
     """
     build_root = tool_config.get("build_dir", _SAM_BUILD_ROOT)
-    template = _SamTemplate(rootpath / tool_config.get("template", "template.yaml"), rootpath, build_root)
+    template_path = rootpath / tool_config.get("template", "template.yaml")
+    template = _SamTemplate(template_path, rootpath, build_root, strict=strict)
     names = tool_config.get("functions")
     if names is None:
         names = template.functions()
@@ -417,7 +440,9 @@ def aws_sam(tool_config: Mapping[str, Any], rootpath: Path) -> FrameworkDefaults
 PRESETS = {"aws-sam": aws_sam}
 
 
-def defaults(framework: str | None, tool_config: Mapping[str, Any], rootpath: Path) -> FrameworkDefaults:
+def defaults(
+    framework: str | None, tool_config: Mapping[str, Any], rootpath: Path, *, strict: bool = True
+) -> FrameworkDefaults:
     supported = ", ".join(sorted(PRESETS))
     if not framework:
         msg = f"[tool.pytest-cov-container] framework is required (supported: {supported})"
@@ -428,4 +453,4 @@ def defaults(framework: str | None, tool_config: Mapping[str, Any], rootpath: Pa
         raise ValueError(
             msg
         )
-    return preset(tool_config, rootpath)
+    return preset(tool_config, rootpath, strict=strict)

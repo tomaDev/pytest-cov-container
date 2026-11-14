@@ -410,6 +410,28 @@ def server():
         assert result.ret != 0
         result.stdout.fnmatch_lines(["*no coverage received*"])
 
+    def test_an_unmeasured_package_is_a_usage_error(self, pytester):
+        self._project(pytester, push=False)
+        # A local package installed editable: the build holds a .pth, not its files.
+        (pytester.path / "src/common/common").mkdir(parents=True)
+        (pytester.path / "src/common/common/net.py").write_text("X = 1\n")
+        (pytester.path / "src/fn/uv.lock").write_text(
+            'version = 1\n\n[[package]]\nname = "common"\nversion = "0.1.0"\nsource = { editable = "../common" }\n'
+        )
+        build = pytester.path / ".aws-sam/build"
+        (build / "template.yaml").write_text(
+            "Resources:\n  Fn:\n    Type: AWS::Serverless::Function\n    Properties:\n      CodeUri: Fn\n"
+        )
+        (build / "Fn/_common.pth").write_text("/checkout/src/common\n")
+        (build / "Fn/common-0.1.0.dist-info").mkdir()
+        (build / "Fn/common-0.1.0.dist-info/RECORD").write_text("_common.pth,,\ncommon-0.1.0.dist-info/RECORD,,\n")
+        result = pytester.runpytest_subprocess("--cov=src")
+        assert result.ret == pytest.ExitCode.USAGE_ERROR
+        result.stderr.fnmatch_lines([
+            "ERROR: pytest-cov-container: Fn: common (../common) is installed but not measured*"
+        ])
+        assert "INTERNALERROR" not in result.stderr.str()
+
     def test_inactive_without_cov(self, pytester):
         self._project(pytester, push=False)
         result = pytester.runpytest_subprocess()
