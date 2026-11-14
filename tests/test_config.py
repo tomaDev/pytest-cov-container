@@ -356,6 +356,45 @@ class TestUvLocalPackages:
         with pytest.raises(UnmeasuredSourceError, match=r"ApiFunction: common \(\.\./common\) is installed but not"):
             self._packages(sam_project)
 
+    def test_a_second_top_level_package_that_matches_nothing_fails(self, sam_project):
+        # One distribution, two top-level packages: common maps, extra's files all differ from the build.
+        _write(sam_project, _PACKAGE | {"src/common/python/extra/x.py": "X = 1\n"})
+        _lock(sam_project, {"common": '{ directory = "../common" }'})
+        _install(sam_project, "ApiFunction", "common", {"common/net.py": _NET, "extra/x.py": "X = 0\n"})
+        match = r"ApiFunction: common \(\.\./common\) is installed but its package dirs \['extra'\] are not measured"
+        with pytest.raises(UnmeasuredSourceError, match=match):
+            self._packages(sam_project)
+
+    def test_a_second_unmatched_top_level_package_only_warns_when_not_strict(self, sam_project):
+        _write(sam_project, _PACKAGE | {"src/common/python/extra/x.py": "X = 1\n"})
+        _lock(sam_project, {"common": '{ directory = "../common" }'})
+        _install(sam_project, "ApiFunction", "common", {"common/net.py": _NET, "extra/x.py": "X = 0\n"})
+        with pytest.warns(UserWarning, match=r"its package dirs \['extra'\] are not measured"):
+            mappings = self._packages(sam_project, "strict = false\n")
+        assert mappings == (SourceMapping("src/common/python/common", "/var/task/common"),)
+
+    def test_an_installed_dir_with_no_sources_is_not_a_failure(self, sam_project):
+        # e.g. a package dir the build generates: nothing on the host to measure.
+        _write(sam_project, _PACKAGE)
+        _lock(sam_project, {"common": '{ directory = "../common" }'})
+        _install(sam_project, "ApiFunction", "common", {"common/net.py": _NET, "generated/g.py": "G = 1\n"})
+        assert self._packages(sam_project) == (SourceMapping("src/common/python/common", "/var/task/common"),)
+
+    def test_an_installed_dir_named_like_a_nested_source_dir_is_not_a_failure(self, sam_project):
+        # common/sub/ is a subpackage in the sources; a top-level sub/ in the build is something else.
+        _write(sam_project, _PACKAGE)
+        _lock(sam_project, {"common": '{ directory = "../common" }'})
+        _install(sam_project, "ApiFunction", "common", {"common/net.py": _NET, "sub/other.py": "O = 1\n"})
+        assert self._packages(sam_project) == (SourceMapping("src/common/python/common", "/var/task/common"),)
+
+    def test_an_installed_dir_whose_files_are_gone_is_not_a_failure(self, sam_project):
+        # RECORD lists extra/x.py, but the build stripped it after install.
+        _write(sam_project, _PACKAGE | {"src/common/python/extra/x.py": "X = 1\n"})
+        _lock(sam_project, {"common": '{ directory = "../common" }'})
+        _install(sam_project, "ApiFunction", "common", {"common/net.py": _NET, "extra/x.py": "X = 1\n"})
+        (sam_project / ".aws-sam/build/ApiFunction/extra/x.py").unlink()
+        assert self._packages(sam_project) == (SourceMapping("src/common/python/common", "/var/task/common"),)
+
     def test_an_unmapped_package_only_warns_when_not_strict(self, sam_project):
         _write(sam_project, _PACKAGE)
         _lock(sam_project, {"common": '{ editable = "../common" }'})

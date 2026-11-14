@@ -25,6 +25,10 @@ _SAM_LAYER_ROOT = "/opt"
 # Directory names never measured: test trees and caches are not deployed, and
 # dot-dirs (``.venv``, ``.aws-sam``) hold third-party or build copies.
 _SOURCE_SKIP_DIRS = frozenset({"__pycache__", "tests"})
+_PACKAGE_FIX = (
+    "ship it non-editable: editable = false in [tool.uv.sources], or uv export --no-editable; "
+    "a build older than the sources: run 'sam build'"
+)
 
 
 class UnmeasuredSourceError(ValueError):
@@ -175,6 +179,31 @@ def _package_dirs(matches: list[tuple[tuple[str, ...], tuple[str, ...], int]]) -
             if tail > 1
         }
     )
+
+
+def _unmatched_package_dirs(
+    sources: list[tuple[tuple[str, ...], bytes]],
+    built: Path,
+    installed: list[Path],
+    matches: list[tuple[tuple[str, ...], tuple[str, ...], int]],
+) -> list[str]:
+    """The top-level package dirs the build installed, with sources on the host, that no match maps.
+
+    A distribution can ship several top-level packages, and one that matches
+    maps only its own dir: another whose files all differ from the build
+    would drop out of coverage. Only a dir that holds an installed file and
+    sits where the matched packages sit in the sources (``python/`` under a
+    module root) counts: a generated dir, or one named like a nested source
+    dir, has nothing to measure.
+    """
+    installed_dirs = {path.parts[0] for path in installed if len(path.parts) > 1 and (built / path).is_file()}
+    # Where the sources hold the top-level packages: what precedes a match whose tail is the whole built path.
+    roots = {rel[: len(rel) - tail] for rel, candidate, tail in matches if tail == len(candidate)}
+    source_dirs = {
+        rel[len(root)] for rel, _ in sources for root in roots if rel[: len(root)] == root and len(rel) > len(root) + 1
+    }
+    mapped = {built_dir[0] for _, built_dir in _package_dirs(matches)}
+    return sorted((installed_dirs & source_dirs) - mapped)
 
 
 def _local_packages(code_dir: Path) -> list[tuple[str, str]]:
@@ -347,8 +376,13 @@ class _SamTemplate:
                 self._unmeasured(
                     f"{unmeasured}: none of its source files' bytes match anything the build installed "
                     "(e.g. an editable install ships a link, not the files)",
-                    "ship it non-editable: editable = false in [tool.uv.sources], or uv export --no-editable; "
-                    "a build older than the sources: run 'sam build'",
+                    _PACKAGE_FIX,
+                )
+            elif unmatched := _unmatched_package_dirs(sources, built, installed, matches):
+                self._unmeasured(
+                    f"{name}: {package} ({path}) is installed but its package dirs {unmatched} are not measured: "
+                    "none of their source files' bytes match anything the build installed",
+                    _PACKAGE_FIX,
                 )
             # A top-level module file has no package dir of its own to map: a
             # packaging-shape limit, not a misconfiguration, so it only warns.
